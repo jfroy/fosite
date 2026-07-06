@@ -6,6 +6,7 @@ package integration_test
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/pkg/errors"
@@ -85,7 +86,9 @@ func authEndpointHandler(t *testing.T, oauth2 fosite.OAuth2Provider, session fos
 			ar.GrantScope("openid")
 		}
 
-		for _, a := range ar.GetRequestedAudience() {
+		// The library itself ignores the "audience" request parameter, so this mock consent grants
+		// it from the form directly, mimicking an application-level audience decision.
+		for _, a := range fosite.RemoveEmpty(strings.Split(ar.GetRequestForm().Get("audience"), " ")) {
 			ar.GrantAudience(a)
 		}
 

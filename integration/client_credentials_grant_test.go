@@ -70,12 +70,18 @@ func runClientCredentialsGrantTest(t *testing.T, strategy oauth2.AccessTokenStra
 			err: true,
 		},
 		{
-			description: "should fail because of ungranted audience",
+			description: "non-whitelisted audience parameter does not fail the request",
 			params:      url.Values{"audience": {"https://www.ory.sh/not-api"}},
 			setup: func() {
 				oauthClient.Scopes = []string{"fosite"}
 			},
-			err: true,
+			check: func(t *testing.T, token *goauth.Token) {
+				var j json.RawMessage
+				introspect(t, ts, token.AccessToken, &j, oauthClient.ClientID, oauthClient.ClientSecret)
+				assert.Equal(t, oauthClient.ClientID, gjson.GetBytes(j, "client_id").String())
+				assert.Equal(t, "fosite", gjson.GetBytes(j, "scope").String())
+				assert.False(t, gjson.GetBytes(j, "aud").Exists())
+			},
 		},
 		{
 			params:      url.Values{"audience": {"https://www.ory.sh/api"}},

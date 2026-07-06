@@ -54,10 +54,6 @@ func (f *Fosite) NewDeviceRequest(ctx context.Context, r *http.Request) (_ Devic
 		return request, err
 	}
 
-	if err := f.validateAudience(ctx, r, request); err != nil {
-		return request, err
-	}
-
 	return request, nil
 }
 

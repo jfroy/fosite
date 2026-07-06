@@ -45,12 +45,12 @@ func runAuthorizeCodeGrantWithPublicClientTest(t *testing.T, strategy interface{
 		authStatusCode int
 	}{
 		{
-			description: "should fail because of audience",
+			description: "non-whitelisted audience parameter does not fail the request",
 			params:      []goauth.AuthCodeOption{goauth.SetAuthURLParam("audience", "https://www.ory.sh/not-api")},
 			setup: func() {
 				state = "12345678901234567890"
 			},
-			authStatusCode: http.StatusNotAcceptable,
+			authStatusCode: http.StatusOK,
 		},
 		{
 			description: "should fail because of scope",
@@ -62,7 +62,7 @@ func runAuthorizeCodeGrantWithPublicClientTest(t *testing.T, strategy interface{
 			authStatusCode: http.StatusNotAcceptable,
 		},
 		{
-			description: "should pass with proper audience",
+			description: "should pass with audience granted by consent",
 			params:      []goauth.AuthCodeOption{goauth.SetAuthURLParam("audience", "https://www.ory.sh/api")},
 			setup: func() {
 				state = "12345678901234567890"
@@ -73,7 +73,7 @@ func runAuthorizeCodeGrantWithPublicClientTest(t *testing.T, strategy interface{
 				b.Client = new(fosite.DefaultClient)
 				b.Session = new(defaultSession)
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&b))
-				assert.EqualValues(t, fosite.Arguments{"https://www.ory.sh/api"}, b.RequestedAudience)
+				assert.Empty(t, b.RequestedAudience)
 				assert.EqualValues(t, fosite.Arguments{"https://www.ory.sh/api"}, b.GrantedAudience)
 				assert.EqualValues(t, "foo-sub", b.Session.(*defaultSession).Subject)
 			},

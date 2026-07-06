@@ -153,9 +153,9 @@ func TestNewAuthorizeRequest(t *testing.T) {
 			},
 			expectedError: ErrInvalidScope,
 		},
-		/* fails because scope not given */
+		/* audience parameter is ignored, even when not whitelisted for the client */
 		{
-			desc: "should fail because client does not have scope baz",
+			desc: "audience parameter is ignored",
 			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
 			query: url.Values{
 				"redirect_uri":  {"https://foo.bar/cb"},
@@ -167,11 +167,26 @@ func TestNewAuthorizeRequest(t *testing.T) {
 			},
 			mock: func() {
 				store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
-					RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"foo", "bar"},
-					Audience: []string{"https://cloud.ory.sh/api"},
+					ResponseTypes: []string{"code token"},
+					RedirectURIs:  []string{"https://foo.bar/cb"},
+					Scopes:        []string{"foo", "bar"},
+					Audience:      []string{"https://cloud.ory.sh/api"},
 				}, nil)
 			},
-			expectedError: ErrInvalidRequest,
+			expect: &AuthorizeRequest{
+				RedirectURI:   redir,
+				ResponseTypes: []string{"code", "token"},
+				State:         "strong-state",
+				Request: Request{
+					Client: &DefaultClient{
+						ResponseTypes: []string{"code token"}, RedirectURIs: []string{"https://foo.bar/cb"},
+						Scopes:   []string{"foo", "bar"},
+						Audience: []string{"https://cloud.ory.sh/api"},
+					},
+					RequestedScope:    []string{"foo", "bar"},
+					RequestedAudience: []string{},
+				},
+			},
 		},
 		/* success case */
 		{
@@ -204,7 +219,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						Audience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
@@ -278,7 +293,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 		},
 		/* repeated audience parameter */
 		{
-			desc: "repeated audience parameter",
+			desc: "repeated audience parameter is ignored",
 			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
 			query: url.Values{
 				"redirect_uri":  {"https://foo.bar/cb"},
@@ -307,13 +322,13 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						Audience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
 		/* repeated audience parameter with tricky values */
 		{
-			desc: "repeated audience parameter with tricky values",
+			desc: "repeated audience parameter with tricky values is ignored",
 			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: ExactAudienceMatchingStrategy}},
 			query: url.Values{
 				"redirect_uri":  {"https://foo.bar/cb"},
@@ -342,7 +357,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						Audience: []string{"test value"},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"test value"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
@@ -377,13 +392,13 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						Audience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
 		/* audience with double spaces between values */
 		{
-			desc: "audience with double spaces between values",
+			desc: "audience with double spaces between values is ignored",
 			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
 			query: url.Values{
 				"redirect_uri":  {"https://foo.bar/cb"},
@@ -412,7 +427,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						Audience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
@@ -513,7 +528,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						ResponseModes: []ResponseModeType{ResponseModeFormPost},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
@@ -555,7 +570,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						ResponseModes: []ResponseModeType{ResponseModeQuery},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},
@@ -597,7 +612,7 @@ func TestNewAuthorizeRequest(t *testing.T) {
 						ResponseModes: []ResponseModeType{ResponseModeFragment},
 					},
 					RequestedScope:    []string{"foo", "bar"},
-					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
+					RequestedAudience: []string{},
 				},
 			},
 		},

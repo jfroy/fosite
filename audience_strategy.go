@@ -4,8 +4,6 @@
 package fosite
 
 import (
-	"context"
-	"net/http"
 	"net/url"
 	"strings"
 
@@ -72,33 +70,5 @@ func ExactAudienceMatchingStrategy(haystack []string, needle []string) error {
 		}
 	}
 
-	return nil
-}
-
-// GetAudiences allows audiences to be provided as repeated "audience" form parameter,
-// or as a space-delimited "audience" form parameter if it is not repeated.
-// RFC 8693 in section 2.1 specifies that multiple audience values should be multiple
-// query parameters, while RFC 6749 says that that request parameter must not be included
-// more than once (and thus why we use space-delimited value). This function tries to satisfy both.
-// If "audience" form parameter is repeated, we do not split the value by space.
-func GetAudiences(form url.Values) []string {
-	audiences := form["audience"]
-	if len(audiences) > 1 {
-		return RemoveEmpty(audiences)
-	} else if len(audiences) == 1 {
-		return RemoveEmpty(strings.Split(audiences[0], " "))
-	} else {
-		return []string{}
-	}
-}
-
-func (f *Fosite) validateAudience(ctx context.Context, r *http.Request, request Requester) error {
-	audience := GetAudiences(request.GetRequestForm())
-
-	if err := f.Config.GetAudienceStrategy(ctx)(request.GetClient().GetAudience(), audience); err != nil {
-		return err
-	}
-
-	request.SetRequestedAudience(audience)
 	return nil
 }

@@ -77,7 +77,7 @@ func TestNewDeviceRequestWithPublicClient(t *testing.T) {
 		},
 		expectedError: ErrInvalidScope,
 	}, {
-		description: "fails because audience not allowed",
+		description: "audience parameter is ignored even when not whitelisted",
 		form: url.Values{
 			"client_id": {"client_id"},
 			"scope":     {"17 42"},
@@ -87,7 +87,6 @@ func TestNewDeviceRequestWithPublicClient(t *testing.T) {
 		mock: func() {
 			store.EXPECT().GetClient(gomock.Any(), gomock.Eq("client_id")).Return(deviceClient, nil)
 		},
-		expectedError: ErrInvalidRequest,
 	}, {
 		description: "fails because resource is malformed",
 		form: url.Values{
@@ -132,6 +131,8 @@ func TestNewDeviceRequestWithPublicClient(t *testing.T) {
 			require.ErrorIs(t, err, c.expectedError)
 			if c.expectedError == nil {
 				assert.NotNil(t, ar.GetRequestedAt())
+				// The "audience" request parameter is never ingested.
+				assert.Empty(t, ar.GetRequestedAudience())
 			}
 		})
 	}
