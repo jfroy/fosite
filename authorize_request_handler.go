@@ -437,6 +437,14 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 		return request, err
 	}
 
+	// Unknown scopes are dropped before the redirect URI validation so that its OpenID Connect
+	// redirect_uri requirement and the later prompt validation only consider scopes the request
+	// can actually be granted. Dropping cannot fail, so error redirectability is unaffected.
+	if f.Config.GetIgnoreUnknownScopes(ctx) {
+		scopes, _ := FilterRequestedScopes(f.Config.GetScopeStrategy(ctx), request.Client, request.GetRequestedScopes(), true)
+		request.SetRequestedScopes(scopes)
+	}
+
 	if err = f.validateAuthorizeRedirectURI(r, request); err != nil {
 		return request, err
 	}

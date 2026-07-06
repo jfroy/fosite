@@ -69,6 +69,13 @@ type AudienceStrategyProvider interface {
 	GetAudienceStrategy(ctx context.Context) AudienceMatchingStrategy
 }
 
+// IgnoreUnknownScopesProvider returns the provider for configuring how unknown requested scopes are handled.
+type IgnoreUnknownScopesProvider interface {
+	// GetIgnoreUnknownScopes returns true if requested scopes that are not covered by the client's registered
+	// scopes should be silently dropped from the request instead of failing it with an invalid_scope error.
+	GetIgnoreUnknownScopes(ctx context.Context) bool
+}
+
 // RedirectSecureCheckerProvider returns the provider for configuring the redirect URL security validator.
 type RedirectSecureCheckerProvider interface {
 	// GetRedirectSecureChecker returns the redirect URL security validator.

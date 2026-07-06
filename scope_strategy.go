@@ -3,10 +3,37 @@
 
 package fosite
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/ory/x/errorsx"
+)
 
 // ScopeStrategy is a strategy for matching scopes.
 type ScopeStrategy func(haystack []string, needle string) bool
+
+// FilterRequestedScopes validates the requested scopes against the client's registered scopes using
+// the given strategy. If ignoreUnknown is true, scope values the client is not allowed to request are
+// removed from the returned list, as recommended by OpenID Connect Core 1.0 Section 3.1.2.1 for scope
+// values that are not understood; otherwise the first such scope value fails with ErrInvalidScope.
+func FilterRequestedScopes(strategy ScopeStrategy, client Client, requested Arguments, ignoreUnknown bool) (Arguments, error) {
+	if !ignoreUnknown {
+		for _, scope := range requested {
+			if !strategy(client.GetScopes(), scope) {
+				return nil, errorsx.WithStack(ErrInvalidScope.WithHintf("The OAuth 2.0 Client is not allowed to request scope '%s'.", scope))
+			}
+		}
+		return requested, nil
+	}
+
+	scopes := make(Arguments, 0, len(requested))
+	for _, scope := range requested {
+		if strategy(client.GetScopes(), scope) {
+			scopes = append(scopes, scope)
+		}
+	}
+	return scopes, nil
+}
 
 func HierarchicScopeStrategy(haystack []string, needle string) bool {
 	for _, this := range haystack {

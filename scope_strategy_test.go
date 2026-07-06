@@ -132,3 +132,36 @@ func TestExactScopeStrategy2ScopeStrategy(t *testing.T) {
 
 	assert.False(t, strategy([]string{}, "foo"))
 }
+
+func TestFilterRequestedScopes(t *testing.T) {
+	client := &DefaultClient{Scopes: []string{"openid", "profile", "email"}}
+
+	t.Run("strict mode rejects the first unknown scope", func(t *testing.T) {
+		_, err := FilterRequestedScopes(ExactScopeStrategy, client, Arguments{"openid", "phone"}, false)
+		assert.EqualError(t, err, ErrInvalidScope.Error())
+	})
+
+	t.Run("strict mode returns the requested scopes unchanged", func(t *testing.T) {
+		scopes, err := FilterRequestedScopes(ExactScopeStrategy, client, Arguments{"openid", "email"}, false)
+		assert.NoError(t, err)
+		assert.Equal(t, Arguments{"openid", "email"}, scopes)
+	})
+
+	t.Run("ignore mode drops unknown scopes", func(t *testing.T) {
+		scopes, err := FilterRequestedScopes(ExactScopeStrategy, client, Arguments{"openid", "phone", "profile", "address"}, true)
+		assert.NoError(t, err)
+		assert.Equal(t, Arguments{"openid", "profile"}, scopes)
+	})
+
+	t.Run("ignore mode may drop every scope", func(t *testing.T) {
+		scopes, err := FilterRequestedScopes(ExactScopeStrategy, client, Arguments{"phone", "address"}, true)
+		assert.NoError(t, err)
+		assert.Empty(t, scopes)
+	})
+
+	t.Run("empty request stays empty", func(t *testing.T) {
+		scopes, err := FilterRequestedScopes(ExactScopeStrategy, client, Arguments{}, true)
+		assert.NoError(t, err)
+		assert.Empty(t, scopes)
+	})
+}

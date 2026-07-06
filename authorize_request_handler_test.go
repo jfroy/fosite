@@ -771,3 +771,72 @@ func TestNewAuthorizeRequestUnsupportedRequestObjectCanRedirectAuthorizeError(t 
 	assert.Equal(t, "request_not_supported", location.Query().Get("error"))
 	assert.Equal(t, "strong-state", location.Query().Get("state"))
 }
+
+func TestNewAuthorizeRequestIgnoresUnknownScopes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	conf := &Fosite{
+		Store: store,
+		Config: &Config{
+			ScopeStrategy:            ExactScopeStrategy,
+			AudienceMatchingStrategy: DefaultAudienceMatchingStrategy,
+			IgnoreUnknownScopes:      true,
+		},
+	}
+	query := url.Values{
+		"redirect_uri":  {"https://foo.bar/cb"},
+		"client_id":     {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+		"scope":         {"openid profile phone"},
+	}
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{RawQuery: query.Encode()}}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
+		RedirectURIs:  []string{"https://foo.bar/cb"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid", "profile", "email"},
+	}, nil)
+
+	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
+	require.NoError(t, err)
+	// The unknown "phone" scope is dropped instead of failing the request.
+	require.Equal(t, Arguments{"openid", "profile"}, ar.GetRequestedScopes())
+}
+
+func TestNewAuthorizeRequestIgnoredOpenIDScopeDoesNotRequireRedirectURI(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	conf := &Fosite{
+		Store: store,
+		Config: &Config{
+			ScopeStrategy:            ExactScopeStrategy,
+			AudienceMatchingStrategy: DefaultAudienceMatchingStrategy,
+			IgnoreUnknownScopes:      true,
+		},
+	}
+	// No redirect_uri parameter: allowed for plain OAuth 2.0 requests when the client has
+	// exactly one registered redirect URI, but required for OpenID Connect requests. The
+	// client is not registered for "openid", so the scope is dropped before that check.
+	query := url.Values{
+		"client_id":     {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+		"scope":         {"openid email"},
+	}
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{RawQuery: query.Encode()}}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
+		RedirectURIs:  []string{"https://foo.bar/cb"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"email"},
+	}, nil)
+
+	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, Arguments{"email"}, ar.GetRequestedScopes())
+}

@@ -223,3 +223,34 @@ func TestNewDeviceRequestWithClientAuthn(t *testing.T) {
 		})
 	}
 }
+
+func TestNewDeviceRequestIgnoresUnknownScopes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := internal.NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	deviceClient := &DefaultClient{ID: "client_id"}
+	deviceClient.Public = true
+	deviceClient.Scopes = []string{"17", "42"}
+	deviceClient.GrantTypes = []string{"urn:ietf:params:oauth:grant-type:device_code"}
+
+	config := &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy, IgnoreUnknownScopes: true}
+	fosite := &Fosite{Store: store, Config: config}
+
+	store.EXPECT().GetClient(gomock.Any(), gomock.Eq("client_id")).Return(deviceClient, nil)
+
+	form := url.Values{
+		"client_id": {"client_id"},
+		"scope":     {"17 42 foo"},
+	}
+	r := &http.Request{
+		PostForm: form,
+		Form:     form,
+		Method:   "POST",
+	}
+
+	ar, err := fosite.NewDeviceRequest(context.Background(), r)
+	require.NoError(t, err)
+	// The unknown "foo" scope is dropped instead of failing the request.
+	assert.Equal(t, Arguments{"17", "42"}, ar.GetRequestedScopes())
+}

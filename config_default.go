@@ -31,6 +31,7 @@ var (
 	_ AccessTokenLifespanProvider                  = (*Config)(nil)
 	_ ScopeStrategyProvider                        = (*Config)(nil)
 	_ AudienceStrategyProvider                     = (*Config)(nil)
+	_ IgnoreUnknownScopesProvider                  = (*Config)(nil)
 	_ RedirectSecureCheckerProvider                = (*Config)(nil)
 	_ RedirectURIMatcherProvider                   = (*Config)(nil)
 	_ RefreshTokenScopesProvider                   = (*Config)(nil)
@@ -110,6 +111,17 @@ type Config struct {
 
 	// ScopeStrategy sets the scope strategy that should be supported, for example fosite.WildcardScopeStrategy.
 	ScopeStrategy ScopeStrategy
+
+	// IgnoreUnknownScopes, if set to true, causes requested scopes that are not covered by the client's registered
+	// scopes to be silently dropped from authorization requests (including PAR) and device authorization requests
+	// instead of failing them with an invalid_scope error, as recommended by OpenID Connect Core 1.0
+	// Section 3.1.2.1 for scope values that are not understood. The effectively granted scopes are reported back
+	// to the client via the "scope" response parameter (RFC 6749 Section 5.1). Note that dropping "openid" this
+	// way degrades the request to a plain OAuth 2.0 request. Token endpoint grants that request scopes directly
+	// (client_credentials, password, RFC 7523 jwt-bearer) and the refresh flow keep strict validation: a machine
+	// client requesting a scope it was never granted is an error (RFC 6749 Section 5.2), and scopes that were
+	// granted but have since been removed from the client still invalidate the refresh flow. Defaults to false.
+	IgnoreUnknownScopes bool
 
 	// AudienceMatchingStrategy sets the audience matching strategy that should be supported, defaults to fosite.DefaultsAudienceMatchingStrategy.
 	AudienceMatchingStrategy AudienceMatchingStrategy
@@ -376,6 +388,12 @@ func (c *Config) GetScopeStrategy(_ context.Context) ScopeStrategy {
 		c.ScopeStrategy = WildcardScopeStrategy
 	}
 	return c.ScopeStrategy
+}
+
+// GetIgnoreUnknownScopes returns true if requested scopes that are not covered by the client's registered scopes
+// should be silently dropped from the request instead of failing it with an invalid_scope error. Defaults to false.
+func (c *Config) GetIgnoreUnknownScopes(_ context.Context) bool {
+	return c.IgnoreUnknownScopes
 }
 
 // GetAudienceStrategy returns the scope strategy to be used. Defaults to glob scope strategy.
