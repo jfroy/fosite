@@ -52,6 +52,10 @@ func (a *Request) GetRequestForm() url.Values {
 	return a.Form
 }
 
+func (a *Request) GetResource() (string, error) {
+	return GetResourceIndicator(a.Form)
+}
+
 func (a *Request) GetRequestedAt() time.Time {
 	return a.RequestedAt
 }

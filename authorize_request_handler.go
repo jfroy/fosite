@@ -449,6 +449,10 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 		return request, err
 	}
 
+	if _, err = ValidateResourceIndicator(request.GetRequestForm()); err != nil {
+		return request, err
+	}
+
 	if len(request.Form.Get("registration")) > 0 {
 		return request, errorsx.WithStack(ErrRegistrationNotSupported)
 	}

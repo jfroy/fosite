@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	. "github.com/ory/fosite"
 )
@@ -31,6 +32,21 @@ func TestRequest(t *testing.T) {
 	assert.Equal(t, r.RequestedScope, r.GetRequestedScopes())
 	assert.Equal(t, r.Form, r.GetRequestForm())
 	assert.Equal(t, r.Session, r.GetSession())
+}
+
+func TestRequestGetResource(t *testing.T) {
+	request := NewRequest()
+	request.Form = url.Values{"resource": {"https://api.example.com"}}
+
+	resource, err := request.GetResource()
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.example.com", resource)
+
+	request.Form = url.Values{"audience": {"https://api.example.com"}}
+	resource, err = request.GetResource()
+	require.NoError(t, err)
+	assert.Empty(t, resource)
+	assert.Empty(t, request.Form.Get("resource"))
 }
 
 func TestMergeRequest(t *testing.T) {

@@ -89,6 +89,15 @@ func TestNewDeviceRequestWithPublicClient(t *testing.T) {
 		},
 		expectedError: ErrInvalidRequest,
 	}, {
+		description: "fails because resource is malformed",
+		form: url.Values{
+			"client_id": {"client_id"},
+			"resource":  {"https://api.example.com#fragment"},
+		},
+		method:        "POST",
+		mock:          func() {},
+		expectedError: ErrInvalidTarget,
+	}, {
 		description: "fails because it doesn't have the proper grant",
 		form: url.Values{
 			"client_id": {"client_id_2"},

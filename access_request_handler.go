@@ -70,6 +70,9 @@ func (f *Fosite) NewAccessRequest(ctx context.Context, r *http.Request, session 
 	if len(accessRequest.GrantTypes) < 1 {
 		return accessRequest, errorsx.WithStack(ErrInvalidRequest.WithHint("Request parameter 'grant_type' is missing"))
 	}
+	if _, err := ValidateResourceIndicator(accessRequest.GetRequestForm()); err != nil {
+		return accessRequest, err
+	}
 
 	client, clientErr := f.AuthenticateClient(ctx, r, r.PostForm)
 	if clientErr == nil {
