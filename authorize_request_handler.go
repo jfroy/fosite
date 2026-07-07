@@ -5,9 +5,11 @@ package fosite
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-jose/go-jose/v4"
@@ -31,6 +33,28 @@ func wrapSigningKeyFailure(outer *RFC6749Error, inner error) *RFC6749Error {
 	return outer
 }
 
+// requestObjectClaimValue converts a request object claim into its request parameter representation.
+// JSON strings, numbers and booleans map to their literal value; structured values such as the OpenID
+// Connect "claims" parameter are re-serialized as JSON, matching the OAuth 2.0 query syntax.
+func requestObjectClaimValue(v interface{}) (string, error) {
+	switch t := v.(type) {
+	case string:
+		return t, nil
+	case bool:
+		return strconv.FormatBool(t), nil
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), nil
+	case json.Number:
+		return t.String(), nil
+	default:
+		value, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(value), nil
+	}
+}
+
 func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.Context, request *AuthorizeRequest, isPARRequest bool) error {
 	var scope Arguments = RemoveEmpty(strings.Split(request.Form.Get("scope"), " "))
 
@@ -47,16 +71,11 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 		return errorsx.WithStack(ErrInvalidRequest.WithHint("OpenID Connect parameters 'request' and 'request_uri' were both given, but you can use at most one."))
 	}
 
-	oidcClient, ok := request.Client.(OpenIDConnectClient)
-	if !ok {
-		if len(request.Form.Get("request_uri")) > 0 {
-			return errorsx.WithStack(ErrRequestURINotSupported.WithHint("OpenID Connect 'request_uri' context was given, but the OAuth 2.0 Client does not implement advanced OpenID Connect capabilities."))
-		}
-		return errorsx.WithStack(ErrRequestNotSupported.WithHint("OpenID Connect 'request' context was given, but the OAuth 2.0 Client does not implement advanced OpenID Connect capabilities."))
-	}
-
-	if oidcClient.GetJSONWebKeys() == nil && len(oidcClient.GetJSONWebKeysURI()) == 0 {
-		return errorsx.WithStack(ErrInvalidRequest.WithHint("OpenID Connect 'request' or 'request_uri' context was given, but the OAuth 2.0 Client does not have any JSON Web Keys registered."))
+	// Unsigned ("none") request objects carry the same trust as plain query parameters and therefore do not
+	// need any client keys, so they are accepted from every client.
+	oidcClient, isOIDCClient := request.Client.(OpenIDConnectClient)
+	if !isOIDCClient && len(request.Form.Get("request_uri")) > 0 {
+		return errorsx.WithStack(ErrRequestURINotSupported.WithHint("OpenID Connect 'request_uri' context was given, but the OAuth 2.0 Client does not implement advanced OpenID Connect capabilities."))
 	}
 
 	assertion := request.Form.Get("request")
@@ -84,18 +103,33 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 		assertion = string(body)
 	}
 
+	supportedAlgs := f.Config.GetSupportedRequestObjectSigningAlgorithms(ctx)
 	token, err := jwt.ParseWithClaims(assertion, jwt.MapClaims{}, func(t *jwt.Token) (interface{}, error) {
+		alg := fmt.Sprintf("%s", t.Header["alg"])
+
 		// request_object_signing_alg - OPTIONAL.
 		//  JWS [JWS] alg algorithm [JWA] that MUST be used for signing Request Objects sent to the OP. All Request Objects from this Client MUST be rejected,
 		// 	if not signed with this algorithm. Request Objects are described in Section 6.1 of OpenID Connect Core 1.0 [OpenID.Core]. This algorithm MUST
 		//	be used both when the Request Object is passed by value (using the request parameter) and when it is passed by reference (using the request_uri parameter).
 		//	Servers SHOULD support RS256. The value none MAY be used. The default, if omitted, is that any algorithm supported by the OP and the RP MAY be used.
-		if oidcClient.GetRequestObjectSigningAlgorithm() != "" && oidcClient.GetRequestObjectSigningAlgorithm() != fmt.Sprintf("%s", t.Header["alg"]) {
-			return nil, errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object uses signing algorithm '%s', but the requested OAuth 2.0 Client enforces signing algorithm '%s'.", t.Header["alg"], oidcClient.GetRequestObjectSigningAlgorithm()))
+		if isOIDCClient && oidcClient.GetRequestObjectSigningAlgorithm() != "" && oidcClient.GetRequestObjectSigningAlgorithm() != alg {
+			return nil, errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object uses signing algorithm '%s', but the requested OAuth 2.0 Client enforces signing algorithm '%s'.", alg, oidcClient.GetRequestObjectSigningAlgorithm()))
+		}
+
+		if len(supportedAlgs) > 0 && !stringslice.Has(supportedAlgs, alg) {
+			return nil, errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object uses signing algorithm '%s', but the authorization server only supports %v.", alg, supportedAlgs))
 		}
 
 		if t.Method == jwt.SigningMethodNone {
 			return jwt.UnsafeAllowNoneSignatureType, nil
+		}
+
+		if !isOIDCClient {
+			return nil, errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object is signed with algorithm '%s', but the OAuth 2.0 Client does not implement advanced OpenID Connect capabilities needed to verify signed request objects.", alg))
+		}
+
+		if oidcClient.GetJSONWebKeys() == nil && len(oidcClient.GetJSONWebKeysURI()) == 0 {
+			return nil, errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object is signed with algorithm '%s', but the OAuth 2.0 Client does not have any JSON Web Keys registered.", alg))
 		}
 
 		switch t.Method {
@@ -125,15 +159,20 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 		}
 	})
 	if err != nil {
-		// Do not re-process already enhanced errors
 		var e *jwt.ValidationError
-		if errors.As(err, &e) {
-			if e.Inner != nil {
+		if !errors.As(err, &e) {
+			return err
+		}
+		if e.Inner != nil {
+			// Do not re-process already enhanced errors: keyfunc failures carry RFC 6749 errors.
+			if rfcErr := new(RFC6749Error); errors.As(e.Inner, &rfcErr) {
 				return e.Inner
 			}
-			return errorsx.WithStack(ErrInvalidRequestObject.WithHint("Unable to verify the request object's signature.").WithWrap(err).WithDebug(err.Error()))
+			// Claim validation failures (e.g. an elapsed "exp" or future "nbf"/"iat") surface as bare
+			// errors and would otherwise be rendered as an unrecognizable server error.
+			return errorsx.WithStack(ErrInvalidRequestObject.WithHint("Unable to verify the request object because its claims could not be validated, check if the expiry time is set correctly.").WithWrap(e.Inner).WithDebug(e.Inner.Error()))
 		}
-		return err
+		return errorsx.WithStack(ErrInvalidRequestObject.WithHint("Unable to verify the request object's signature.").WithWrap(err).WithDebug(err.Error()))
 	} else if err := token.Claims.Valid(); err != nil {
 		return errorsx.WithStack(ErrInvalidRequestObject.WithHint("Unable to verify the request object because its claims could not be validated, check if the expiry time is set correctly.").WithWrap(err).WithDebug(err.Error()))
 	}
@@ -145,19 +184,33 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 		return errorsx.WithStack(ErrInvalidRequestObject.WithHint("Pushed Authorization Requests can not contain the 'request_uri' parameter."))
 	}
 
-	for k, v := range claims {
-		request.Form.Set(k, fmt.Sprintf("%s", v))
-	}
-
-	claimScope := RemoveEmpty(strings.Split(request.Form.Get("scope"), " "))
-	for _, s := range scope {
-		if !stringslice.Has(claimScope, s) {
-			claimScope = append(claimScope, s)
+	// OpenID Connect Core 1.0 section 6.1 requires the client_id claim, when present in the request
+	// object, to be identical to the client_id request parameter the client was resolved from. A
+	// non-string claim can never match a client ID and must not slip past into the merged form.
+	if rawClientID, hasClientID := claims["client_id"]; hasClientID {
+		clientID, isString := rawClientID.(string)
+		if !isString || (request.Client != nil && clientID != request.Client.GetID()) {
+			return errorsx.WithStack(ErrInvalidRequestObject.WithHint("The request object contains a 'client_id' claim that does not match the 'client_id' request parameter."))
 		}
 	}
 
+	for k, v := range claims {
+		// Request objects must not nest further request objects (OpenID Connect Core 1.0 section 6.1),
+		// so these claims are never mapped back to the parameters they would shadow.
+		if k == "request" || k == "request_uri" {
+			continue
+		}
+		value, err := requestObjectClaimValue(v)
+		if err != nil {
+			return errorsx.WithStack(ErrInvalidRequestObject.WithHintf("The request object claim '%s' could not be interpreted as a request parameter.", k).WithWrap(err).WithDebug(err.Error()))
+		}
+		request.Form.Set(k, value)
+	}
+
+	// A scope claim in the request object supersedes the outer scope parameter entirely instead of
+	// being unioned with it: request object values take precedence (OpenID Connect Core 1.0 section
+	// 6.1) and RFC 9101 section 6.3 requires using only the request object's value when both are set.
 	request.State = request.Form.Get("state")
-	request.Form.Set("scope", strings.Join(claimScope, " "))
 	return nil
 }
 

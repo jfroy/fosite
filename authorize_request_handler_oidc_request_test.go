@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -65,6 +66,17 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 	validRequestObject := mustGenerateAssertion(t, jwt.MapClaims{"scope": "foo", "foo": "bar", "baz": "baz", "response_type": "token", "response_mode": "post_form"}, key, "kid-foo")
 	validRequestObjectWithoutKid := mustGenerateAssertion(t, jwt.MapClaims{"scope": "foo", "foo": "bar", "baz": "baz"}, key, "")
 	validNoneRequestObject := mustGenerateNoneAssertion(t, jwt.MapClaims{"scope": "foo", "foo": "bar", "baz": "baz", "state": "some-state"})
+	signedRequestObjectWithClientID := mustGenerateAssertion(t, jwt.MapClaims{"scope": "foo", "client_id": "foo"}, key, "kid-foo")
+	noneRequestObjectWithWrongClientID := mustGenerateNoneAssertion(t, jwt.MapClaims{"scope": "foo", "client_id": "not-foo"})
+	noneRequestObjectWithTypedClaims := mustGenerateNoneAssertion(t, jwt.MapClaims{
+		"scope":   "foo",
+		"max_age": 3600,
+		"foo":     true,
+		"claims":  map[string]interface{}{"userinfo": map[string]interface{}{"email": nil}},
+	})
+	noneRequestObjectWithNestedRequest := mustGenerateNoneAssertion(t, jwt.MapClaims{"scope": "foo", "request": "nested", "request_uri": "https://foo.bar/nested"})
+	expiredNoneRequestObject := mustGenerateNoneAssertion(t, jwt.MapClaims{"scope": "foo", "exp": time.Now().Add(-time.Hour).Unix()})
+	noneRequestObjectWithNumericClientID := mustGenerateNoneAssertion(t, jwt.MapClaims{"scope": "foo", "client_id": 12345})
 
 	var reqH http.HandlerFunc = func(rw http.ResponseWriter, r *http.Request) {
 		rw.Write([]byte(validRequestObject))
@@ -83,6 +95,7 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 		client Client
 		form   url.Values
 		d      string
+		algs   []string
 
 		expectErr       error
 		expectErrReason string
@@ -107,9 +120,9 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 			expectForm: url.Values{"request": {"foo"}},
 		},
 		{
-			d:          "should fail because not an OpenIDConnect compliant client",
+			d:          "should fail because the request object is malformed even though the client is not an OpenIDConnect compliant client",
 			form:       url.Values{"scope": {"openid"}, "request": {"foo"}},
-			expectErr:  ErrRequestNotSupported,
+			expectErr:  ErrInvalidRequestObject,
 			expectForm: url.Values{"scope": {"openid"}},
 		},
 		{
@@ -119,11 +132,27 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 			expectForm: url.Values{"scope": {"openid"}},
 		},
 		{
-			d:          "should fail because token invalid an no key set",
+			d:          "should fail because request uri is not whitelisted and no key set",
 			form:       url.Values{"scope": {"openid"}, "request_uri": {"foo"}},
 			client:     &DefaultOpenIDConnectClient{RequestObjectSigningAlgorithm: "RS256"},
-			expectErr:  ErrInvalidRequest,
+			expectErr:  ErrInvalidRequestURI,
 			expectForm: url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the request object is signed but the client is not an OpenIDConnect compliant client",
+			form:            url.Values{"scope": {"openid"}, "request": {validRequestObject}},
+			client:          &DefaultClient{ID: "foo"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object is signed with algorithm 'RS256', but the OAuth 2.0 Client does not implement advanced OpenID Connect capabilities needed to verify signed request objects.",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the request object is signed but the client has no JSON Web Keys registered",
+			form:            url.Values{"scope": {"openid"}, "request": {validRequestObject}},
+			client:          &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object is signed with algorithm 'RS256', but the OAuth 2.0 Client does not have any JSON Web Keys registered.",
+			expectForm:      url.Values{"scope": {"openid"}},
 		},
 		{
 			d:          "should fail because token invalid",
@@ -153,38 +182,135 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 			form:   url.Values{"scope": {"openid"}, "response_type": {"code"}, "response_mode": {"none"}, "request": {validRequestObject}},
 			client: &DefaultOpenIDConnectClient{JSONWebKeys: jwks, RequestObjectSigningAlgorithm: "RS256"},
 			// The values from form are overwritten by the request object.
-			expectForm: url.Values{"response_type": {"token"}, "response_mode": {"post_form"}, "scope": {"foo openid"}, "request": {validRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"response_type": {"token"}, "response_mode": {"post_form"}, "scope": {"foo"}, "request": {validRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
 		},
 		{
 			d:          "should pass even if kid is unset",
 			form:       url.Values{"scope": {"openid"}, "request": {validRequestObjectWithoutKid}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeys: jwks, RequestObjectSigningAlgorithm: "RS256"},
-			expectForm: url.Values{"scope": {"foo openid"}, "request": {validRequestObjectWithoutKid}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"scope": {"foo"}, "request": {validRequestObjectWithoutKid}, "foo": {"bar"}, "baz": {"baz"}},
 		},
 		{
 			d:          "should fail because request uri is not whitelisted",
 			form:       url.Values{"scope": {"openid"}, "request_uri": {reqTS.URL}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeysURI: reqJWK.URL, RequestObjectSigningAlgorithm: "RS256"},
-			expectForm: url.Values{"scope": {"foo openid"}, "request_uri": {reqTS.URL}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"scope": {"foo"}, "request_uri": {reqTS.URL}, "foo": {"bar"}, "baz": {"baz"}},
 			expectErr:  ErrInvalidRequestURI,
 		},
 		{
 			d:          "should pass and set request_uri parameters properly and also fetch jwk from remote",
 			form:       url.Values{"scope": {"openid"}, "request_uri": {reqTS.URL}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeysURI: reqJWK.URL, RequestObjectSigningAlgorithm: "RS256", RequestURIs: []string{reqTS.URL}},
-			expectForm: url.Values{"response_type": {"token"}, "response_mode": {"post_form"}, "scope": {"foo openid"}, "request_uri": {reqTS.URL}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"response_type": {"token"}, "response_mode": {"post_form"}, "scope": {"foo"}, "request_uri": {reqTS.URL}, "foo": {"bar"}, "baz": {"baz"}},
 		},
 		{
 			d:          "should pass when request object uses algorithm none",
 			form:       url.Values{"scope": {"openid"}, "request": {validNoneRequestObject}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeysURI: reqJWK.URL, RequestObjectSigningAlgorithm: "none"},
-			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo openid"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
 		},
 		{
 			d:          "should pass when request object uses algorithm none and the client did not explicitly allow any algorithm",
 			form:       url.Values{"scope": {"openid"}, "request": {validNoneRequestObject}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeysURI: reqJWK.URL},
-			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo openid"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+		},
+		{
+			d:          "should pass when request object uses algorithm none and the client is not an OpenIDConnect compliant client",
+			form:       url.Values{"scope": {"openid"}, "request": {validNoneRequestObject}},
+			client:     &DefaultClient{ID: "foo"},
+			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+		},
+		{
+			d:          "should pass when request object uses algorithm none and the server only supports none",
+			form:       url.Values{"scope": {"openid"}, "request": {validNoneRequestObject}},
+			client:     &DefaultClient{ID: "foo"},
+			algs:       []string{"none"},
+			expectForm: url.Values{"state": {"some-state"}, "scope": {"foo"}, "request": {validNoneRequestObject}, "foo": {"bar"}, "baz": {"baz"}},
+		},
+		{
+			d:               "should fail because the request object algorithm is not supported by the server",
+			form:            url.Values{"scope": {"openid"}, "request": {validRequestObject}},
+			client:          &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}, JSONWebKeys: jwks},
+			algs:            []string{"none"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object uses signing algorithm 'RS256', but the authorization server only supports [none].",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the client_id claim does not match the client_id request parameter",
+			form:            url.Values{"scope": {"openid"}, "request": {noneRequestObjectWithWrongClientID}},
+			client:          &DefaultClient{ID: "foo"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object contains a 'client_id' claim that does not match the 'client_id' request parameter.",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:          "should pass because the client_id claim matches the client_id request parameter",
+			form:       url.Values{"scope": {"openid"}, "request": {signedRequestObjectWithClientID}},
+			client:     &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}, JSONWebKeys: jwks, RequestObjectSigningAlgorithm: "RS256"},
+			expectForm: url.Values{"client_id": {"foo"}, "scope": {"foo"}, "request": {signedRequestObjectWithClientID}},
+		},
+		{
+			d:      "should map non-string claims to their request parameter representation",
+			form:   url.Values{"scope": {"openid"}, "request": {noneRequestObjectWithTypedClaims}},
+			client: &DefaultClient{ID: "foo"},
+			expectForm: url.Values{
+				"scope":   {"foo"},
+				"request": {noneRequestObjectWithTypedClaims},
+				"max_age": {"3600"},
+				"foo":     {"true"},
+				"claims":  {`{"userinfo":{"email":null}}`},
+			},
+		},
+		{
+			d:          "should ignore nested request and request_uri claims",
+			form:       url.Values{"scope": {"openid"}, "request": {noneRequestObjectWithNestedRequest}},
+			client:     &DefaultClient{ID: "foo"},
+			expectForm: url.Values{"scope": {"foo"}, "request": {noneRequestObjectWithNestedRequest}},
+		},
+		{
+			d:               "should fail because the request object is expired",
+			form:            url.Values{"scope": {"openid"}, "request": {expiredNoneRequestObject}},
+			client:          &DefaultClient{ID: "foo"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "Unable to verify the request object because its claims could not be validated, check if the expiry time is set correctly.",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the client_id claim is not a string",
+			form:            url.Values{"scope": {"openid"}, "request": {noneRequestObjectWithNumericClientID}},
+			client:          &DefaultClient{ID: "foo"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object contains a 'client_id' claim that does not match the 'client_id' request parameter.",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the server allowlist applies even when the client-registered algorithm matches",
+			form:            url.Values{"scope": {"openid"}, "request": {validRequestObject}},
+			client:          &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}, JSONWebKeys: jwks, RequestObjectSigningAlgorithm: "RS256"},
+			algs:            []string{"none"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object uses signing algorithm 'RS256', but the authorization server only supports [none].",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the client-registered algorithm applies even when the server allowlist matches",
+			form:            url.Values{"scope": {"openid"}, "request": {validRequestObject}},
+			client:          &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}, JSONWebKeys: jwks, RequestObjectSigningAlgorithm: "none"},
+			algs:            []string{"RS256", "none"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object uses signing algorithm 'RS256', but the requested OAuth 2.0 Client enforces signing algorithm 'none'.",
+			expectForm:      url.Values{"scope": {"openid"}},
+		},
+		{
+			d:               "should fail because the algorithm of the request object fetched from the request_uri is not supported by the server",
+			form:            url.Values{"scope": {"openid"}, "request_uri": {reqTS.URL}},
+			client:          &DefaultOpenIDConnectClient{DefaultClient: &DefaultClient{ID: "foo"}, JSONWebKeysURI: reqJWK.URL, RequestURIs: []string{reqTS.URL}},
+			algs:            []string{"none"},
+			expectErr:       ErrInvalidRequestObject,
+			expectErrReason: "The request object uses signing algorithm 'RS256', but the authorization server only supports [none].",
+			expectForm:      url.Values{"scope": {"openid"}},
 		},
 	} {
 		t.Run(fmt.Sprintf("case=%d/description=%s", k, tc.d), func(t *testing.T) {
@@ -195,7 +321,12 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 				},
 			}
 
-			err := f.authorizeRequestParametersFromOpenIDConnectRequest(context.Background(), req, false)
+			provider := f
+			if tc.algs != nil {
+				provider = &Fosite{Config: &Config{JWKSFetcherStrategy: NewDefaultJWKSFetcherStrategy(), SupportedRequestObjectSigningAlgorithms: tc.algs}}
+			}
+
+			err := provider.authorizeRequestParametersFromOpenIDConnectRequest(context.Background(), req, false)
 			if tc.expectErr != nil {
 				require.EqualError(t, err, tc.expectErr.Error(), "%+v", err)
 				if tc.expectErrReason != "" {

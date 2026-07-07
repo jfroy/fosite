@@ -26,47 +26,48 @@ const (
 )
 
 var (
-	_ AuthorizeCodeLifespanProvider                = (*Config)(nil)
-	_ RefreshTokenLifespanProvider                 = (*Config)(nil)
-	_ AccessTokenLifespanProvider                  = (*Config)(nil)
-	_ ScopeStrategyProvider                        = (*Config)(nil)
-	_ AudienceStrategyProvider                     = (*Config)(nil)
-	_ IgnoreUnknownScopesProvider                  = (*Config)(nil)
-	_ RedirectSecureCheckerProvider                = (*Config)(nil)
-	_ RedirectURIMatcherProvider                   = (*Config)(nil)
-	_ RefreshTokenScopesProvider                   = (*Config)(nil)
-	_ DisableRefreshTokenValidationProvider        = (*Config)(nil)
-	_ AccessTokenIssuerProvider                    = (*Config)(nil)
-	_ JWTScopeFieldProvider                        = (*Config)(nil)
-	_ AllowedPromptsProvider                       = (*Config)(nil)
-	_ OmitRedirectScopeParamProvider               = (*Config)(nil)
-	_ MinParameterEntropyProvider                  = (*Config)(nil)
-	_ SanitationAllowedProvider                    = (*Config)(nil)
-	_ EnforcePKCEForPublicClientsProvider          = (*Config)(nil)
-	_ EnablePKCEPlainChallengeMethodProvider       = (*Config)(nil)
-	_ EnforcePKCEProvider                          = (*Config)(nil)
-	_ GrantTypeJWTBearerCanSkipClientAuthProvider  = (*Config)(nil)
-	_ GrantTypeJWTBearerIDOptionalProvider         = (*Config)(nil)
-	_ GrantTypeJWTBearerIssuedDateOptionalProvider = (*Config)(nil)
-	_ GetJWTMaxDurationProvider                    = (*Config)(nil)
-	_ IDTokenLifespanProvider                      = (*Config)(nil)
-	_ IDTokenIssuerProvider                        = (*Config)(nil)
-	_ JWKSFetcherStrategyProvider                  = (*Config)(nil)
-	_ ClientAuthenticationStrategyProvider         = (*Config)(nil)
-	_ SendDebugMessagesToClientsProvider           = (*Config)(nil)
-	_ ResponseModeHandlerExtensionProvider         = (*Config)(nil)
-	_ MessageCatalogProvider                       = (*Config)(nil)
-	_ FormPostHTMLTemplateProvider                 = (*Config)(nil)
-	_ TokenURLProvider                             = (*Config)(nil)
-	_ GetSecretsHashingProvider                    = (*Config)(nil)
-	_ HTTPClientProvider                           = (*Config)(nil)
-	_ HMACHashingProvider                          = (*Config)(nil)
-	_ AuthorizeEndpointHandlersProvider            = (*Config)(nil)
-	_ TokenEndpointHandlersProvider                = (*Config)(nil)
-	_ TokenIntrospectionHandlersProvider           = (*Config)(nil)
-	_ RevocationHandlersProvider                   = (*Config)(nil)
-	_ PushedAuthorizeRequestHandlersProvider       = (*Config)(nil)
-	_ PushedAuthorizeRequestConfigProvider         = (*Config)(nil)
+	_ AuthorizeCodeLifespanProvider                   = (*Config)(nil)
+	_ RefreshTokenLifespanProvider                    = (*Config)(nil)
+	_ AccessTokenLifespanProvider                     = (*Config)(nil)
+	_ ScopeStrategyProvider                           = (*Config)(nil)
+	_ AudienceStrategyProvider                        = (*Config)(nil)
+	_ IgnoreUnknownScopesProvider                     = (*Config)(nil)
+	_ SupportedRequestObjectSigningAlgorithmsProvider = (*Config)(nil)
+	_ RedirectSecureCheckerProvider                   = (*Config)(nil)
+	_ RedirectURIMatcherProvider                      = (*Config)(nil)
+	_ RefreshTokenScopesProvider                      = (*Config)(nil)
+	_ DisableRefreshTokenValidationProvider           = (*Config)(nil)
+	_ AccessTokenIssuerProvider                       = (*Config)(nil)
+	_ JWTScopeFieldProvider                           = (*Config)(nil)
+	_ AllowedPromptsProvider                          = (*Config)(nil)
+	_ OmitRedirectScopeParamProvider                  = (*Config)(nil)
+	_ MinParameterEntropyProvider                     = (*Config)(nil)
+	_ SanitationAllowedProvider                       = (*Config)(nil)
+	_ EnforcePKCEForPublicClientsProvider             = (*Config)(nil)
+	_ EnablePKCEPlainChallengeMethodProvider          = (*Config)(nil)
+	_ EnforcePKCEProvider                             = (*Config)(nil)
+	_ GrantTypeJWTBearerCanSkipClientAuthProvider     = (*Config)(nil)
+	_ GrantTypeJWTBearerIDOptionalProvider            = (*Config)(nil)
+	_ GrantTypeJWTBearerIssuedDateOptionalProvider    = (*Config)(nil)
+	_ GetJWTMaxDurationProvider                       = (*Config)(nil)
+	_ IDTokenLifespanProvider                         = (*Config)(nil)
+	_ IDTokenIssuerProvider                           = (*Config)(nil)
+	_ JWKSFetcherStrategyProvider                     = (*Config)(nil)
+	_ ClientAuthenticationStrategyProvider            = (*Config)(nil)
+	_ SendDebugMessagesToClientsProvider              = (*Config)(nil)
+	_ ResponseModeHandlerExtensionProvider            = (*Config)(nil)
+	_ MessageCatalogProvider                          = (*Config)(nil)
+	_ FormPostHTMLTemplateProvider                    = (*Config)(nil)
+	_ TokenURLProvider                                = (*Config)(nil)
+	_ GetSecretsHashingProvider                       = (*Config)(nil)
+	_ HTTPClientProvider                              = (*Config)(nil)
+	_ HMACHashingProvider                             = (*Config)(nil)
+	_ AuthorizeEndpointHandlersProvider               = (*Config)(nil)
+	_ TokenEndpointHandlersProvider                   = (*Config)(nil)
+	_ TokenIntrospectionHandlersProvider              = (*Config)(nil)
+	_ RevocationHandlersProvider                      = (*Config)(nil)
+	_ PushedAuthorizeRequestHandlersProvider          = (*Config)(nil)
+	_ PushedAuthorizeRequestConfigProvider            = (*Config)(nil)
 )
 
 type Config struct {
@@ -122,6 +123,14 @@ type Config struct {
 	// client requesting a scope it was never granted is an error (RFC 6749 Section 5.2), and scopes that were
 	// granted but have since been removed from the client still invalidate the refresh flow. Defaults to false.
 	IgnoreUnknownScopes bool
+
+	// SupportedRequestObjectSigningAlgorithms sets the JWS "alg" values accepted for OpenID Connect request
+	// objects (the "request" and "request_uri" authorization request parameters), mirroring the
+	// "request_object_signing_alg_values_supported" discovery metadata. Request objects using any other
+	// algorithm are rejected with an invalid_request_object error. A client's registered
+	// request_object_signing_alg is enforced in addition to this list. An empty list accepts every
+	// algorithm supported by the implementation ("none" and the RS/ES/PS families).
+	SupportedRequestObjectSigningAlgorithms []string
 
 	// AudienceMatchingStrategy sets the audience matching strategy that should be supported, defaults to fosite.DefaultsAudienceMatchingStrategy.
 	AudienceMatchingStrategy AudienceMatchingStrategy
@@ -394,6 +403,12 @@ func (c *Config) GetScopeStrategy(_ context.Context) ScopeStrategy {
 // should be silently dropped from the request instead of failing it with an invalid_scope error. Defaults to false.
 func (c *Config) GetIgnoreUnknownScopes(_ context.Context) bool {
 	return c.IgnoreUnknownScopes
+}
+
+// GetSupportedRequestObjectSigningAlgorithms returns the JWS "alg" values accepted for OpenID Connect request
+// objects. An empty list accepts every algorithm supported by the implementation.
+func (c *Config) GetSupportedRequestObjectSigningAlgorithms(_ context.Context) []string {
+	return c.SupportedRequestObjectSigningAlgorithms
 }
 
 // GetAudienceStrategy returns the scope strategy to be used. Defaults to glob scope strategy.

@@ -111,3 +111,19 @@ Filtering runs before the OIDC redirect-URI and prompt checks. Token-endpoint
 grants (`client_credentials`, `password`) and the refresh flow stay strict.
 Defaults to `false`. Lets MCP clients that blindly request scopes like `phone`
 or `offline_access` still authenticate.
+
+### 12. `feat: support unsigned request objects for all clients`
+
+Reworks OpenID Connect request object handling (`request`/`request_uri`
+authorization parameters):
+
+- Unsigned (`alg: none`) request objects are now accepted from **every** client,
+  not only clients implementing `fosite.OpenIDConnectClient` with registered
+  JSON Web Keys. Signed request objects still require an `OpenIDConnectClient`
+  with a JWKS (by value or URI), and `request_uri` still requires registered
+  request URIs.
+- New `Config.SupportedRequestObjectSigningAlgorithms` (plus the
+  `SupportedRequestObjectSigningAlgorithmsProvider` interface), mirroring the
+  `request_object_signing_alg_values_supported` discovery metadata. Request
+  objects using an algorithm outside the list are rejected with
+  `invalid_request_object`.

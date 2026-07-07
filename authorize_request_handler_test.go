@@ -744,7 +744,7 @@ func TestNewAuthorizeRequestUnsupportedRequestObjectCanRedirectAuthorizeError(t 
 	store := NewMockStorage(ctrl)
 	defer ctrl.Finish()
 
-	conf := &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}}
+	conf := &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy, SupportedRequestObjectSigningAlgorithms: []string{"RS256"}}}
 	query := url.Values{
 		"redirect_uri":  {"https://foo.bar/cb"},
 		"client_id":     {"1234"},
@@ -758,7 +758,7 @@ func TestNewAuthorizeRequestUnsupportedRequestObjectCanRedirectAuthorizeError(t 
 	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
 
 	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
-	require.EqualError(t, err, ErrRequestNotSupported.Error())
+	require.EqualError(t, err, ErrInvalidRequestObject.Error())
 	require.True(t, ar.IsRedirectURIValid())
 
 	rw := httptest.NewRecorder()
@@ -768,7 +768,7 @@ func TestNewAuthorizeRequestUnsupportedRequestObjectCanRedirectAuthorizeError(t 
 	location, err := url.Parse(rw.Header().Get("Location"))
 	require.NoError(t, err)
 	assert.Equal(t, "https://foo.bar/cb", location.Scheme+"://"+location.Host+location.Path)
-	assert.Equal(t, "request_not_supported", location.Query().Get("error"))
+	assert.Equal(t, "invalid_request_object", location.Query().Get("error"))
 	assert.Equal(t, "strong-state", location.Query().Get("state"))
 }
 

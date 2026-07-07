@@ -76,6 +76,15 @@ type IgnoreUnknownScopesProvider interface {
 	GetIgnoreUnknownScopes(ctx context.Context) bool
 }
 
+// SupportedRequestObjectSigningAlgorithmsProvider returns the provider for configuring the JWS algorithms
+// accepted for OpenID Connect request objects.
+type SupportedRequestObjectSigningAlgorithmsProvider interface {
+	// GetSupportedRequestObjectSigningAlgorithms returns the JWS "alg" values accepted for request objects
+	// passed via the OpenID Connect "request" and "request_uri" authorization request parameters. An empty
+	// list means every algorithm supported by the implementation is accepted.
+	GetSupportedRequestObjectSigningAlgorithms(ctx context.Context) []string
+}
+
 // RedirectSecureCheckerProvider returns the provider for configuring the redirect URL security validator.
 type RedirectSecureCheckerProvider interface {
 	// GetRedirectSecureChecker returns the redirect URL security validator.
