@@ -54,6 +54,7 @@ var (
 	_ IDTokenIssuerProvider                           = (*Config)(nil)
 	_ JWKSFetcherStrategyProvider                     = (*Config)(nil)
 	_ ClientAuthenticationStrategyProvider            = (*Config)(nil)
+	_ ClientResolverProvider                          = (*Config)(nil)
 	_ SendDebugMessagesToClientsProvider              = (*Config)(nil)
 	_ ResponseModeHandlerExtensionProvider            = (*Config)(nil)
 	_ MessageCatalogProvider                          = (*Config)(nil)
@@ -191,6 +192,9 @@ type Config struct {
 
 	// ClientAuthenticationStrategy indicates the Strategy to authenticate client requests
 	ClientAuthenticationStrategy ClientAuthenticationStrategy
+
+	// ClientResolver optionally resolves clients before the registered-client store lookup completes
+	ClientResolver ClientResolver
 
 	// ResponseModeHandlerExtension provides a handler for custom response modes
 	ResponseModeHandlerExtension ResponseModeHandler
@@ -543,6 +547,11 @@ func (c *Config) GetJWTMaxDuration(_ context.Context) time.Duration {
 // `fosite.Fosite.DefaultClientAuthenticationStrategy`
 func (c *Config) GetClientAuthenticationStrategy(_ context.Context) ClientAuthenticationStrategy {
 	return c.ClientAuthenticationStrategy
+}
+
+// GetClientResolver returns the configured client resolver.
+func (c *Config) GetClientResolver(_ context.Context) ClientResolver {
+	return c.ClientResolver
 }
 
 // GetDisableRefreshTokenValidation returns whether to disable the validation of the refresh token.

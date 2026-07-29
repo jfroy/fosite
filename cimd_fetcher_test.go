@@ -92,7 +92,7 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 
 	t.Run("invalid client_id URL is rejected before fetching", func(t *testing.T) {
 		f := newTestFetcher(nil)
-		_, _, err := f.Fetch(t.Context(), "https://app.example.com")
+		_, _, err := f.Fetch(t.Context(), "https://app.example.com#fragment")
 		require.Error(t, err)
 	})
 
@@ -100,15 +100,26 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 		f := NewDefaultCIMDFetcher()
 		_, _, err := f.Fetch(t.Context(), "https://127.0.0.1/oauth/client")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "private IP addresses are not allowed")
+		assert.Contains(t, err.Error(), "special-use IP addresses are not allowed")
+	})
+
+	t.Run("non-JSON content type is rejected", func(t *testing.T) {
+		resp := cimdMockResponse(http.StatusOK, body)
+		resp.Header.Set("Content-Type", "text/html")
+		f := newTestFetcher(map[string]*http.Response{id: resp})
+		_, _, err := f.Fetch(t.Context(), id)
+		require.Error(t, err)
 	})
 }
 
 func TestDefaultCIMDFetcher_ParseCacheTTL(t *testing.T) {
 	f := NewDefaultCIMDFetcher()
 	assert.Equal(t, DefaultCIMDCacheTTL, f.parseCacheTTL(""))
-	assert.Equal(t, DefaultCIMDCacheTTL, f.parseCacheTTL("no-store"))
+	assert.Equal(t, time.Duration(0), f.parseCacheTTL("no-store"))
+	assert.Equal(t, time.Duration(0), f.parseCacheTTL("max-age=600, no-cache"))
+	assert.Equal(t, time.Duration(0), f.parseCacheTTL("max-age=0"))
 	assert.Equal(t, 10*time.Minute, f.parseCacheTTL("max-age=600"))
+	assert.Equal(t, 10*time.Minute, f.parseCacheTTL(`MAX-AGE="600"`))
 	assert.Equal(t, DefaultCIMDMinCacheTTL, f.parseCacheTTL("max-age=1"))
 	assert.Equal(t, DefaultCIMDMaxCacheTTL, f.parseCacheTTL("max-age=999999"))
 	assert.Equal(t, 10*time.Minute, f.parseCacheTTL("public, max-age=600"))
@@ -120,13 +131,29 @@ func TestDefaultCIMDFetcher_IsPrivateIP(t *testing.T) {
 			{IP: net.ParseIP("fd00::"), Mask: net.CIDRMask(8, 128)},
 		}),
 	)
-	private := []string{"127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.1.1", "100.64.0.1", "::1", "fe80::1", "fd00::1", "0.0.0.0"}
+	private := []string{
+		"127.0.0.1",
+		"10.0.0.1",
+		"192.168.1.1",
+		"172.16.0.1",
+		"169.254.1.1",
+		"100.64.0.1",
+		"192.0.2.1",
+		"198.18.0.1",
+		"::1",
+		"fe80::1",
+		"fd00::1",
+		"100:0:0:1::1",
+		"3fff::1",
+		"5f00::1",
+		"0.0.0.0",
+	}
 	for _, s := range private {
-		assert.Truef(t, f.isPrivateIP(net.ParseIP(s)), "expected %s private", s)
+		assert.Truef(t, f.isSpecialUseIP(net.ParseIP(s)), "expected %s special-use", s)
 	}
 	public := []string{"8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"}
 	for _, s := range public {
-		assert.Falsef(t, f.isPrivateIP(net.ParseIP(s)), "expected %s public", s)
+		assert.Falsef(t, f.isSpecialUseIP(net.ParseIP(s)), "expected %s public", s)
 	}
 }
 

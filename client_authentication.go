@@ -34,7 +34,12 @@ func (f *Fosite) findClientPublicJWK(ctx context.Context, oidcClient OpenIDConne
 	}
 
 	if location := oidcClient.GetJSONWebKeysURI(); len(location) > 0 {
-		keys, err := f.Config.GetJWKSFetcherStrategy(ctx).Resolve(ctx, location, false)
+		fetcher := f.Config.GetJWKSFetcherStrategy(ctx)
+		if resolver, ok := oidcClient.(CIMDJWKSResolver); ok {
+			fetcher = cimdJWKSFetcherStrategy{resolver: resolver}
+		}
+
+		keys, err := fetcher.Resolve(ctx, location, false)
 		if err != nil {
 			return nil, err
 		}
@@ -43,7 +48,7 @@ func (f *Fosite) findClientPublicJWK(ctx context.Context, oidcClient OpenIDConne
 			return key, nil
 		}
 
-		keys, err = f.Config.GetJWKSFetcherStrategy(ctx).Resolve(ctx, location, true)
+		keys, err = fetcher.Resolve(ctx, location, true)
 		if err != nil {
 			return nil, err
 		}
@@ -52,6 +57,14 @@ func (f *Fosite) findClientPublicJWK(ctx context.Context, oidcClient OpenIDConne
 	}
 
 	return nil, errorsx.WithStack(ErrInvalidClient.WithHint("The OAuth 2.0 Client has no JSON Web Keys set registered, but they are needed to complete the request."))
+}
+
+type cimdJWKSFetcherStrategy struct {
+	resolver CIMDJWKSResolver
+}
+
+func (s cimdJWKSFetcherStrategy) Resolve(ctx context.Context, _ string, ignoreCache bool) (*jose.JSONWebKeySet, error) {
+	return s.resolver.ResolveCIMDJSONWebKeys(ctx, ignoreCache)
 }
 
 // AuthenticateClient authenticates client requests using the configured strategy
@@ -91,7 +104,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 				}
 			}
 
-			client, err = f.Store.GetClient(ctx, clientID)
+			client, err = f.resolveClient(ctx, clientID)
 			if err != nil {
 				return nil, errorsx.WithStack(ErrInvalidClient.WithWrap(err).WithDebug(err.Error()))
 			}
@@ -197,7 +210,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 		return nil, err
 	}
 
-	client, err := f.Store.GetClient(ctx, clientID)
+	client, err := f.resolveClient(ctx, clientID)
 	if err != nil {
 		return nil, errorsx.WithStack(ErrInvalidClient.WithWrap(err).WithDebug(err.Error()))
 	}

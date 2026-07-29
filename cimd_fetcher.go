@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,9 +29,34 @@ const (
 	DefaultCIMDCacheTTL     = 1 * time.Hour
 )
 
-// cgnatIPNet is the RFC 6598 shared address space (100.64.0.0/10), which
-// net.IP.IsPrivate does not cover. It is treated as private to block SSRF.
-var cgnatIPNet = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+// specialUseIPNets contains special-purpose ranges that net.IP does not reject
+// through its built-in private, loopback, link-local, or unspecified checks.
+var specialUseIPNets = parseCIMDSpecialUseRanges([]string{
+	"0.0.0.0/8",
+	"100.64.0.0/10",
+	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"192.31.196.0/24",
+	"192.52.193.0/24",
+	"192.88.99.0/24",
+	"192.175.48.0/24",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
+	"100::/64",
+	"100:0:0:1::/64",
+	"2001::/23",
+	"2001:db8::/32",
+	"2002::/16",
+	"2620:4f:8000::/48",
+	"3fff::/20",
+	"5f00::/16",
+	"ff00::/8",
+})
 
 // CIMDFetcher retrieves and validates the Client ID Metadata Document located
 // at a client_id URL.
@@ -41,12 +67,19 @@ type CIMDFetcher interface {
 	Fetch(ctx context.Context, clientID string) (doc *ClientMetadataDocument, ttl time.Duration, err error)
 }
 
+// CIMDSecureHTTPClientProvider exposes the guarded client for fetching URLs referenced by a metadata document.
+type CIMDSecureHTTPClientProvider interface {
+	ValidateFetchURL(context.Context, string) error
+	CIMDHTTPClient() *http.Client
+}
+
 // DefaultCIMDFetcher is the default CIMDFetcher. It blocks requests to private
 // IP addresses (SSRF), refuses redirects, caps the response body size, and
 // requires a 200 response.
 type DefaultCIMDFetcher struct {
 	client        *http.Client
 	baseTransport http.RoundTripper
+	decorate      func(http.RoundTripper) http.RoundTripper
 	userAgent     string
 
 	maxSize    int64
@@ -63,12 +96,20 @@ type DefaultCIMDFetcher struct {
 // CIMDFetcherOption configures a DefaultCIMDFetcher.
 type CIMDFetcherOption func(*DefaultCIMDFetcher)
 
-// WithCIMDTransport sets the base HTTP transport used for fetches. When it is
-// nil or an *http.Transport, the fetcher clones it and installs a connect-time
-// SSRF guard (unless private IPs are allowed); any other RoundTripper is used
-// as-is (for example a test mock), relying on a resolution-time SSRF check.
+// WithCIMDTransport sets the base HTTP transport used for fetches.
+//
+// A nil or *http.Transport value receives both resolution-time and connect-time
+// SSRF protection. Other RoundTripper implementations are intended for tests or
+// transports that already enforce equivalent connect-time protection.
 func WithCIMDTransport(rt http.RoundTripper) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) { f.baseTransport = rt }
+}
+
+// WithCIMDTransportDecorator wraps the guarded transport without hiding its dialer from the fetcher.
+//
+// This is the preferred option for tracing, metrics, and other middleware.
+func WithCIMDTransportDecorator(decorate func(http.RoundTripper) http.RoundTripper) CIMDFetcherOption {
+	return func(f *DefaultCIMDFetcher) { f.decorate = decorate }
 }
 
 // WithCIMDUserAgent sets the User-Agent header sent when fetching.
@@ -125,10 +166,9 @@ func NewDefaultCIMDFetcher(opts ...CIMDFetcherOption) *DefaultCIMDFetcher {
 }
 
 var _ CIMDFetcher = (*DefaultCIMDFetcher)(nil)
+var _ CIMDSecureHTTPClientProvider = (*DefaultCIMDFetcher)(nil)
 
-// buildHTTPClient constructs the HTTP client used for fetching. It always refuses
-// redirects. When the base transport is nil or an *http.Transport, it installs a
-// connect-time SSRF guard that rejects connections to private IPs.
+// buildHTTPClient constructs the HTTP client used for fetching.
 func (f *DefaultCIMDFetcher) buildHTTPClient() *http.Client {
 	c := &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -144,6 +184,11 @@ func (f *DefaultCIMDFetcher) buildHTTPClient() *http.Client {
 		c.Transport = f.guardTransport(base)
 	default:
 		c.Transport = base
+	}
+	if f.decorate != nil {
+		if decorated := f.decorate(c.Transport); decorated != nil {
+			c.Transport = decorated
+		}
 	}
 	return c
 }
@@ -171,8 +216,8 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 			if ip == nil {
 				return fmt.Errorf("could not parse dialed address %q", address)
 			}
-			if f.isPrivateIP(ip) {
-				return errors.New("private IP addresses are not allowed")
+			if f.isSpecialUseIP(ip) {
+				return errors.New("special-use IP addresses are not allowed")
 			}
 			return nil
 		},
@@ -182,25 +227,16 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 }
 
 func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadataDocument, time.Duration, error) {
-	u, err := url.Parse(clientID)
+	u, err := ParseCIMDURL(clientID)
 	if err != nil {
-		return nil, 0, err
-	}
-	if err := ValidateCIMDURL(u); err != nil {
 		return nil, 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
-	if !f.allowPrivateIPs {
-		private, err := f.isPrivateURL(ctx, u)
-		if err != nil {
-			return nil, 0, err
-		}
-		if private {
-			return nil, 0, errors.New("private IP addresses are not allowed")
-		}
+	if err := f.validateResolvedURL(ctx, u); err != nil {
+		return nil, 0, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clientID, nil)
@@ -218,6 +254,9 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("unexpected status %d fetching client metadata", resp.StatusCode)
+	}
+	if err := validateCIMDContentType(resp.Header.Get("Content-Type")); err != nil {
+		return nil, 0, err
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, f.maxSize+1))
@@ -239,18 +278,32 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 	return &doc, f.parseCacheTTL(resp.Header.Get("Cache-Control")), nil
 }
 
-// parseCacheTTL derives the cache lifetime from a Cache-Control header value,
-// clamping the max-age directive into [minTTL, maxTTL] and falling back to
-// defaultTTL when no usable directive is present.
+// parseCacheTTL honors explicit no-cache directives before applying a bounded max-age value
+// and falls back to the configured default when the header has no usable directive
 func (f *DefaultCIMDFetcher) parseCacheTTL(cacheControl string) time.Duration {
+	// Check bypass directives first so they take precedence regardless of header order
 	for part := range strings.SplitSeq(cacheControl, ",") {
-		v, ok := strings.CutPrefix(strings.TrimSpace(part), "max-age=")
-		if !ok {
+		directive, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+		if strings.EqualFold(directive, "no-store") || strings.EqualFold(directive, "no-cache") {
+			return 0
+		}
+	}
+	// Use the first valid max-age value and clamp it to the configured cache bounds
+	for part := range strings.SplitSeq(cacheControl, ",") {
+		directive, value, hasValue := strings.Cut(strings.TrimSpace(part), "=")
+		if !hasValue || !strings.EqualFold(directive, "max-age") {
 			continue
 		}
-		secs, err := strconv.Atoi(v)
-		if err != nil {
+		v := strings.Trim(value, `"`)
+		secs, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || secs < 0 {
 			continue
+		}
+		if secs == 0 {
+			return 0
+		}
+		if secs > int64(f.maxTTL/time.Second) {
+			return f.maxTTL
 		}
 		d := time.Duration(secs) * time.Second
 		switch {
@@ -265,28 +318,84 @@ func (f *DefaultCIMDFetcher) parseCacheTTL(cacheControl string) time.Duration {
 	return f.defaultTTL
 }
 
-// isPrivateURL resolves the host of u and reports if any address is private.
-func (f *DefaultCIMDFetcher) isPrivateURL(ctx context.Context, u *url.URL) (bool, error) {
+// ValidateFetchURL checks whether an HTTP URL referenced by a metadata document is safe to fetch.
+func (f *DefaultCIMDFetcher) ValidateFetchURL(ctx context.Context, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid metadata URL: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return errors.New("metadata URL must use the https scheme")
+	}
+	if u.Hostname() == "" {
+		return errors.New("metadata URL must have a host")
+	}
+	if u.User != nil {
+		return errors.New("metadata URL must not contain userinfo")
+	}
+	return f.validateResolvedURL(ctx, u)
+}
+
+// CIMDHTTPClient returns a copy of the guarded HTTP client for fetching referenced metadata URLs.
+func (f *DefaultCIMDFetcher) CIMDHTTPClient() *http.Client {
+	client := *f.client
+	client.Timeout = f.timeout
+	return &client
+}
+
+// validateResolvedURL rejects every special-use address returned for the URL host.
+func (f *DefaultCIMDFetcher) validateResolvedURL(ctx context.Context, u *url.URL) error {
+	if f.allowPrivateIPs {
+		return nil
+	}
+	special, err := f.isSpecialUseURL(ctx, u)
+	if err != nil {
+		return err
+	}
+	if special {
+		return errors.New("special-use IP addresses are not allowed")
+	}
+	return nil
+}
+
+// validateCIMDContentType accepts the standard JSON media type and structured JSON suffixes.
+func validateCIMDContentType(value string) error {
+	if value == "" {
+		return nil
+	}
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return fmt.Errorf("invalid client metadata content type: %w", err)
+	}
+	if mediaType != "application/json" && !(strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json")) {
+		return fmt.Errorf("client metadata response has unsupported content type %q", mediaType)
+	}
+	return nil
+}
+
+// isSpecialUseURL resolves the host of u and reports if any address is special-use.
+func (f *DefaultCIMDFetcher) isSpecialUseURL(ctx context.Context, u *url.URL) (bool, error) {
 	ips, err := f.resolver.LookupIPAddr(ctx, u.Hostname())
 	if err != nil || len(ips) == 0 {
 		return false, errors.New("cannot resolve hostname")
 	}
 	for _, addr := range ips {
-		if f.isPrivateIP(addr.IP) {
+		if f.isSpecialUseIP(addr.IP) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// isPrivateIP reports whether ip is one of: loopback, RFC 1918 / ULA private,
-// link-local, unspecified, RFC 6598 CGNAT space, or in an extra private range.
-func (f *DefaultCIMDFetcher) isPrivateIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+// isSpecialUseIP reports whether ip is unusable as a public CIMD fetch destination.
+func (f *DefaultCIMDFetcher) isSpecialUseIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 		return true
 	}
-	if cgnatIPNet.Contains(ip) {
-		return true
+	for _, r := range specialUseIPNets {
+		if r.Contains(ip) {
+			return true
+		}
 	}
 	for _, r := range f.extraPrivateRanges {
 		if r != nil && r.Contains(ip) {
@@ -294,4 +403,16 @@ func (f *DefaultCIMDFetcher) isPrivateIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+func parseCIMDSpecialUseRanges(cidrs []string) []*net.IPNet {
+	ranges := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(err)
+		}
+		ranges = append(ranges, ipNet)
+	}
+	return ranges
 }
