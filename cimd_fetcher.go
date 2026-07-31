@@ -22,11 +22,11 @@ import (
 // Default limits for fetching Client ID Metadata Documents. They follow the
 // recommendations in draft-ietf-oauth-client-id-metadata-document.
 const (
-	DefaultCIMDMaxSize      = 5 * 1024 // 5 KiB (draft recommendation)
-	DefaultCIMDFetchTimeout = 15 * time.Second
-	DefaultCIMDMinCacheTTL  = 5 * time.Minute
-	DefaultCIMDMaxCacheTTL  = 24 * time.Hour
-	DefaultCIMDCacheTTL     = 1 * time.Hour
+	DefaultCIMDMaxSize              = 5 * 1024 // 5 KiB (draft recommendation)
+	DefaultCIMDFetchTimeout         = 15 * time.Second
+	DefaultCIMDMaxCacheTTL          = 24 * time.Hour
+	DefaultCIMDCacheTTL             = 1 * time.Hour
+	DefaultCIMDReferencedURLMaxSize = 1 * 1024 * 1024
 )
 
 // specialUseIPNets contains special-purpose ranges that net.IP does not reject
@@ -62,9 +62,8 @@ var specialUseIPNets = parseCIMDSpecialUseRanges([]string{
 // at a client_id URL.
 type CIMDFetcher interface {
 	// Fetch retrieves the metadata document at clientID (an https URL), validates
-	// it, and returns a parsed document along with the cache lifetime derived
-	// from the response's Cache-Control header.
-	Fetch(ctx context.Context, clientID string) (doc *ClientMetadataDocument, ttl time.Duration, err error)
+	// it, and returns a parsed document along with the response's cache policy.
+	Fetch(ctx context.Context, clientID string) (doc *ClientMetadataDocument, cachePolicy CIMDCachePolicy, err error)
 }
 
 // CIMDSecureHTTPClientProvider exposes the guarded client for fetching URLs referenced by a metadata document.
@@ -84,7 +83,6 @@ type DefaultCIMDFetcher struct {
 
 	maxSize    int64
 	timeout    time.Duration
-	minTTL     time.Duration
 	maxTTL     time.Duration
 	defaultTTL time.Duration
 
@@ -96,18 +94,16 @@ type DefaultCIMDFetcher struct {
 // CIMDFetcherOption configures a DefaultCIMDFetcher.
 type CIMDFetcherOption func(*DefaultCIMDFetcher)
 
-// WithCIMDTransport sets the base HTTP transport used for fetches.
+// WithCIMDTransport sets the base transport used by the fetcher.
 //
-// A nil or *http.Transport value receives both resolution-time and connect-time
-// SSRF protection. Other RoundTripper implementations are intended for tests or
-// transports that already enforce equivalent connect-time protection.
+// A custom non-*http.Transport is a trusted escape hatch for tests and controlled integrations because Fosite cannot install its dial-time SSRF guard around it.
 func WithCIMDTransport(rt http.RoundTripper) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) { f.baseTransport = rt }
 }
 
 // WithCIMDTransportDecorator wraps the guarded transport without hiding its dialer from the fetcher.
 //
-// This is the preferred option for tracing, metrics, and other middleware.
+// This is the preferred option for tracing, metrics, and other middleware, and decorators must call the supplied transport rather than replace it.
 func WithCIMDTransportDecorator(decorate func(http.RoundTripper) http.RoundTripper) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) { f.decorate = decorate }
 }
@@ -117,16 +113,16 @@ func WithCIMDUserAgent(ua string) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) { f.userAgent = ua }
 }
 
-// WithCIMDMaxSize sets the maximum accepted response body size in bytes.
+// WithCIMDMaxSize sets the maximum accepted response size in bytes, applied to the body and to the
+// response headers separately.
 func WithCIMDMaxSize(n int64) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) { f.maxSize = n }
 }
 
-// WithCIMDCacheTTLBounds sets the minimum, maximum, and default cache
-// lifetimes applied to the max-age directive of a fetched document.
-func WithCIMDCacheTTLBounds(minTTL, maxTTL, defaultTTL time.Duration) CIMDFetcherOption {
+// WithCIMDCacheTTLBounds sets the maximum and default cache lifetimes without extending an explicit origin lifetime.
+func WithCIMDCacheTTLBounds(maxTTL, defaultTTL time.Duration) CIMDFetcherOption {
 	return func(f *DefaultCIMDFetcher) {
-		f.minTTL, f.maxTTL, f.defaultTTL = minTTL, maxTTL, defaultTTL
+		f.maxTTL, f.defaultTTL = maxTTL, defaultTTL
 	}
 }
 
@@ -153,7 +149,6 @@ func NewDefaultCIMDFetcher(opts ...CIMDFetcherOption) *DefaultCIMDFetcher {
 		userAgent:  "fosite/oidc-client-metadata-fetcher",
 		maxSize:    DefaultCIMDMaxSize,
 		timeout:    DefaultCIMDFetchTimeout,
-		minTTL:     DefaultCIMDMinCacheTTL,
 		maxTTL:     DefaultCIMDMaxCacheTTL,
 		defaultTTL: DefaultCIMDCacheTTL,
 		resolver:   net.DefaultResolver,
@@ -176,15 +171,16 @@ func (f *DefaultCIMDFetcher) buildHTTPClient() *http.Client {
 		},
 	}
 
-	switch base := f.baseTransport.(type) {
+	switch tr := f.baseTransport.(type) {
 	case nil:
-		tr, _ := http.DefaultTransport.(*http.Transport)
-		c.Transport = f.guardTransport(tr)
+		defaultTransport, _ := http.DefaultTransport.(*http.Transport)
+		c.Transport = f.guardTransport(defaultTransport)
 	case *http.Transport:
-		c.Transport = f.guardTransport(base)
+		c.Transport = f.guardTransport(tr)
 	default:
-		c.Transport = base
+		c.Transport = tr
 	}
+
 	if f.decorate != nil {
 		if decorated := f.decorate(c.Transport); decorated != nil {
 			c.Transport = decorated
@@ -201,9 +197,21 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 	} else {
 		tr = tr.Clone()
 	}
+
+	// Limit the size of the response headers to prevent memory exhaustion attacks.
+	tr.MaxResponseHeaderBytes = f.maxSize * 8
+	tr.ResponseHeaderTimeout = f.timeout
+
 	if f.allowPrivateIPs {
 		return tr
 	}
+
+	// A proxy would hide the final destination from the guarded dialer and bypass its IP checks.
+	tr.Proxy = nil
+	// Custom TLS dialers bypass DialContext, so the guarded transport must perform the TLS handshake itself.
+	tr.DialTLS = nil
+	tr.DialTLSContext = nil
+
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -226,96 +234,139 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 	return tr
 }
 
-func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadataDocument, time.Duration, error) {
+func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadataDocument, CIMDCachePolicy, error) {
 	u, err := ParseCIMDURL(clientID)
 	if err != nil {
-		return nil, 0, err
+		return nil, CIMDCachePolicy{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
 	if err := f.validateResolvedURL(ctx, u); err != nil {
-		return nil, 0, err
+		if ctx.Err() != nil {
+			return nil, CIMDCachePolicy{}, ctx.Err()
+		}
+		return nil, CIMDCachePolicy{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clientID, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, CIMDCachePolicy{}, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", f.userAgent)
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		if ctx.Err() != nil {
+			return nil, CIMDCachePolicy{}, ctx.Err()
+		}
+		return nil, CIMDCachePolicy{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("unexpected status %d fetching client metadata", resp.StatusCode)
+		err := fmt.Errorf("unexpected status %d fetching client metadata", resp.StatusCode)
+		return nil, CIMDCachePolicy{}, err
 	}
 	if err := validateCIMDContentType(resp.Header.Get("Content-Type")); err != nil {
-		return nil, 0, err
+		return nil, CIMDCachePolicy{}, err
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, f.maxSize+1))
 	if err != nil {
-		return nil, 0, err
+		return nil, CIMDCachePolicy{}, err
 	}
 	if int64(len(body)) > f.maxSize {
-		return nil, 0, errors.New("client metadata document exceeds maximum size")
+		return nil, CIMDCachePolicy{}, errors.New("client metadata document exceeds maximum size")
 	}
 
 	var doc ClientMetadataDocument
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, 0, fmt.Errorf("invalid client metadata JSON: %w", err)
+		return nil, CIMDCachePolicy{}, fmt.Errorf("invalid client metadata JSON: %w", err)
 	}
 	if err := doc.Validate(clientID); err != nil {
-		return nil, 0, err
+		return nil, CIMDCachePolicy{}, err
 	}
 
-	return &doc, f.parseCacheTTL(resp.Header.Get("Cache-Control")), nil
+	return &doc, f.parseCachePolicy(resp.Header, time.Now()), nil
 }
 
-// parseCacheTTL honors explicit no-cache directives before applying a bounded max-age value
-// and falls back to the configured default when the header has no usable directive
-func (f *DefaultCIMDFetcher) parseCacheTTL(cacheControl string) time.Duration {
-	// Check bypass directives first so they take precedence regardless of header order
-	for part := range strings.SplitSeq(cacheControl, ",") {
-		directive, _, _ := strings.Cut(strings.TrimSpace(part), "=")
-		if strings.EqualFold(directive, "no-store") || strings.EqualFold(directive, "no-cache") {
-			return 0
+// parseCachePolicy derives a bounded freshness lifetime and whether the response may be stored.
+func (f *DefaultCIMDFetcher) parseCachePolicy(header http.Header, now time.Time) CIMDCachePolicy {
+	directives := parseCIMDCacheControl(header.Values("Cache-Control"))
+	if _, noStore := directives["no-store"]; noStore {
+		return CIMDCachePolicy{}
+	}
+
+	policy := CIMDCachePolicy{Store: true}
+	if _, noCache := directives["no-cache"]; noCache {
+		return policy
+	}
+
+	freshness := f.defaultTTL
+	if seconds, ok := cacheDirectiveSeconds(directives, "s-maxage"); ok {
+		freshness = boundedCacheDuration(seconds, f.maxTTL)
+	} else if seconds, ok := cacheDirectiveSeconds(directives, "max-age"); ok {
+		freshness = boundedCacheDuration(seconds, f.maxTTL)
+	} else if expires, err := http.ParseTime(header.Get("Expires")); err == nil {
+		date := now
+		if parsedDate, err := http.ParseTime(header.Get("Date")); err == nil {
+			date = parsedDate
+		}
+		freshness = expires.Sub(date)
+	}
+	if freshness > f.maxTTL {
+		freshness = f.maxTTL
+	}
+	if freshness < 0 {
+		freshness = 0
+	}
+
+	currentAge := time.Duration(0)
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(header.Get("Age")), 10, 64); err == nil && seconds > 0 {
+		currentAge = boundedCacheDuration(seconds, f.maxTTL)
+	}
+	if date, err := http.ParseTime(header.Get("Date")); err == nil && now.After(date) && now.Sub(date) > currentAge {
+		currentAge = now.Sub(date)
+	}
+	policy.TTL = max(0, freshness-currentAge)
+	return policy
+}
+
+func parseCIMDCacheControl(values []string) map[string]string {
+	directives := make(map[string]string)
+	for _, value := range values {
+		for part := range strings.SplitSeq(value, ",") {
+			name, directiveValue, hasValue := strings.Cut(strings.TrimSpace(part), "=")
+			name = strings.ToLower(name)
+			if name == "" {
+				continue
+			}
+			if hasValue {
+				directiveValue = strings.Trim(strings.TrimSpace(directiveValue), `"`)
+			}
+			directives[name] = directiveValue
 		}
 	}
-	// Use the first valid max-age value and clamp it to the configured cache bounds
-	for part := range strings.SplitSeq(cacheControl, ",") {
-		directive, value, hasValue := strings.Cut(strings.TrimSpace(part), "=")
-		if !hasValue || !strings.EqualFold(directive, "max-age") {
-			continue
-		}
-		v := strings.Trim(value, `"`)
-		secs, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || secs < 0 {
-			continue
-		}
-		if secs == 0 {
-			return 0
-		}
-		if secs > int64(f.maxTTL/time.Second) {
-			return f.maxTTL
-		}
-		d := time.Duration(secs) * time.Second
-		switch {
-		case d < f.minTTL:
-			return f.minTTL
-		case d > f.maxTTL:
-			return f.maxTTL
-		default:
-			return d
-		}
+	return directives
+}
+
+func cacheDirectiveSeconds(directives map[string]string, name string) (int64, bool) {
+	value, ok := directives[name]
+	if !ok {
+		return 0, false
 	}
-	return f.defaultTTL
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	return seconds, err == nil && seconds >= 0
+}
+
+func boundedCacheDuration(seconds int64, limit time.Duration) time.Duration {
+	if limit <= 0 || seconds >= int64(limit/time.Second) {
+		return max(0, limit)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // ValidateFetchURL checks whether an HTTP URL referenced by a metadata document is safe to fetch.
@@ -376,7 +427,10 @@ func validateCIMDContentType(value string) error {
 // isSpecialUseURL resolves the host of u and reports if any address is special-use.
 func (f *DefaultCIMDFetcher) isSpecialUseURL(ctx context.Context, u *url.URL) (bool, error) {
 	ips, err := f.resolver.LookupIPAddr(ctx, u.Hostname())
-	if err != nil || len(ips) == 0 {
+	if err != nil {
+		return false, fmt.Errorf("cannot resolve hostname: %w", err)
+	}
+	if len(ips) == 0 {
 		return false, errors.New("cannot resolve hostname")
 	}
 	for _, addr := range ips {

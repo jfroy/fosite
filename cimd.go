@@ -4,12 +4,17 @@
 package fosite
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/hashicorp/go-retryablehttp"
@@ -59,6 +64,9 @@ func ValidateCIMDURL(u *url.URL) error {
 	}
 	if u.Fragment != "" || u.RawFragment != "" {
 		return errors.New("client_id URL must not contain a fragment")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return errors.New("client_id URL must not contain a query component")
 	}
 	if u.Path == "" {
 		return errors.New("client_id URL must contain a path component")
@@ -172,6 +180,9 @@ func (d *ClientMetadataDocument) Validate(clientID string) error {
 	if d.ClientSecret != nil || d.ClientSecretExpiresAt != nil {
 		return errors.New("client metadata document must not contain a client secret")
 	}
+	if d.TokenEndpointAuthMethod == "" {
+		return errors.New("client metadata document must explicitly set token_endpoint_auth_method because the RFC 7591 default client_secret_basic is not permitted")
+	}
 	switch d.TokenEndpointAuthMethod {
 	case "client_secret_basic", "client_secret_post", "client_secret_jwt":
 		return fmt.Errorf("client metadata document must not use symmetric authentication method %q", d.TokenEndpointAuthMethod)
@@ -189,6 +200,37 @@ func (d *ClientMetadataDocument) Validate(clientID string) error {
 	if d.TokenEndpointAuthMethod == "private_key_jwt" && d.JWKS == nil && d.JWKSURI == "" {
 		return errors.New("private_key_jwt requires jwks or jwks_uri")
 	}
+	return d.validateRedirectURIs()
+}
+
+// validateRedirectURIs enforces the registration requirement of section 4.2 and RFC 7591 section 5.
+//
+// Rejecting malformed entries here attributes the error to the document, rather than surfacing it
+// much later as an unrelated "redirect_uri is not registered" failure in the authorize flow.
+func (d *ClientMetadataDocument) validateRedirectURIs() error {
+	// RFC 7591 section 2 defaults an omitted grant_types to authorization_code.
+	grantTypes := d.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code"}
+	}
+	needsRedirect := slices.Contains(grantTypes, "authorization_code") || slices.Contains(grantTypes, "implicit")
+	if needsRedirect && len(d.RedirectURIs) == 0 {
+		return errors.New("client metadata document must contain redirect_uris for redirect-based grant types")
+	}
+
+	for _, raw := range d.RedirectURIs {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("client metadata document has an invalid redirect_uris entry %q: %w", raw, err)
+		}
+		if !u.IsAbs() {
+			return fmt.Errorf("redirect_uris entry %q must be an absolute URI", raw)
+		}
+		if u.Fragment != "" || u.RawFragment != "" || strings.Contains(raw, "#") {
+			return fmt.Errorf("redirect_uris entry %q must not contain a fragment", raw)
+		}
+	}
+
 	return nil
 }
 
@@ -197,8 +239,18 @@ type CIMDClient struct {
 	*DefaultOpenIDConnectClient
 	Document *ClientMetadataDocument
 
+	// mu guards the lazily installed fetch fields below. A cache that hands the same *CIMDClient
+	// to concurrent resolutions would otherwise race on first use.
+	mu          sync.Mutex
 	jwksFetcher JWKSFetcherStrategy
 	validateURL func(context.Context, string) error
+	httpClient  *http.Client
+}
+
+// CIMDSecureFetcher is implemented by clients whose document-supplied URLs must be dereferenced
+// through the SSRF-guarded transport rather than the authorization server's general HTTP client.
+type CIMDSecureFetcher interface {
+	FetchCIMDReferencedURL(ctx context.Context, rawURL string) (*http.Response, error)
 }
 
 // CIMDJWKSResolver resolves keys referenced by a metadata client through its guarded fetcher.
@@ -219,8 +271,13 @@ func NewCIMDClient(doc *ClientMetadataDocument) (*CIMDClient, error) {
 	}
 
 	authMethod := doc.TokenEndpointAuthMethod
-	if authMethod == "" {
-		authMethod = "none"
+	grantTypes := append([]string(nil), doc.GrantTypes...)
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code"}
+	}
+	responseTypes := append([]string(nil), doc.ResponseTypes...)
+	if len(responseTypes) == 0 {
+		responseTypes = []string{"code"}
 	}
 
 	return &CIMDClient{
@@ -228,8 +285,8 @@ func NewCIMDClient(doc *ClientMetadataDocument) (*CIMDClient, error) {
 			DefaultClient: &DefaultClient{
 				ID:            doc.ClientID,
 				RedirectURIs:  append([]string(nil), doc.RedirectURIs...),
-				GrantTypes:    append([]string(nil), doc.GrantTypes...),
-				ResponseTypes: append([]string(nil), doc.ResponseTypes...),
+				GrantTypes:    grantTypes,
+				ResponseTypes: responseTypes,
 				Scopes:        strings.Fields(doc.Scope),
 				Public:        authMethod == "none",
 			},
@@ -254,33 +311,107 @@ func (c *CIMDClient) ResolveCIMDJSONWebKeys(ctx context.Context, ignoreCache boo
 	if c.JSONWebKeysURI == "" {
 		return nil, errors.New("CIMD client has no jwks_uri")
 	}
-	if c.jwksFetcher == nil || c.validateURL == nil {
+	c.mu.Lock()
+	fetcher, validateURL := c.jwksFetcher, c.validateURL
+	c.mu.Unlock()
+
+	if fetcher == nil || validateURL == nil {
 		return nil, errors.New("CIMD client has no secure jwks_uri fetcher")
 	}
-	if err := c.validateURL(ctx, c.JSONWebKeysURI); err != nil {
+	if err := validateURL(ctx, c.JSONWebKeysURI); err != nil {
 		return nil, fmt.Errorf("jwks_uri is not safe to fetch: %w", err)
 	}
-	return c.jwksFetcher.Resolve(ctx, c.JSONWebKeysURI, ignoreCache)
+	return fetcher.Resolve(ctx, c.JSONWebKeysURI, ignoreCache)
 }
 
-func (c *CIMDClient) configureSecureHTTPClient(provider CIMDSecureHTTPClientProvider) error {
-	if c.JSONWebKeysURI == "" {
+// configureSecureHTTPClient installs a guarded HTTP client and JWKS fetcher if the client references external URLs.
+func (c *CIMDClient) configureSecureHTTPClient(provider CIMDSecureHTTPClientProvider, sharedJWKSFetcher func(*http.Client) JWKSFetcherStrategy) error {
+	needsKeys := c.JSONWebKeysURI != ""
+	needsFetch := len(c.RequestURIs) > 0
+	if !needsKeys && !needsFetch {
 		return nil
 	}
-	if c.jwksFetcher != nil && c.validateURL != nil {
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If the client already has a secure fetcher and HTTP client, no further configuration is needed.
+	if c.validateURL != nil && c.httpClient != nil && (!needsKeys || c.jwksFetcher != nil) {
 		return nil
 	}
 	if provider == nil {
-		return errors.New("CIMD client with jwks_uri requires a secure HTTP client")
+		return errors.New("CIMD client referencing external URLs requires a secure HTTP client")
 	}
 	httpClient := provider.CIMDHTTPClient()
 	if httpClient == nil {
 		return errors.New("CIMD secure HTTP client is nil")
 	}
-	retryClient := retryablehttp.NewClient()
-	retryClient.HTTPClient = httpClient
-	retryClient.Logger = nil
-	c.jwksFetcher = NewDefaultJWKSFetcherStrategy(JWKSFetcherWithHTTPClient(retryClient))
 	c.validateURL = provider.ValidateFetchURL
+	c.httpClient = httpClient
+
+	if needsKeys {
+		if sharedJWKSFetcher == nil {
+			return errors.New("CIMD client referencing jwks_uri requires a shared JWKS fetcher")
+		}
+		c.jwksFetcher = sharedJWKSFetcher(httpClient)
+	}
 	return nil
+}
+
+func newCIMDJWKSFetcherStrategy(httpClient *http.Client) JWKSFetcherStrategy {
+	limitedHTTPClient := *httpClient
+	base := limitedHTTPClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	limitedHTTPClient.Transport = cimdResponseSizeLimitTransport{base: base, maxSize: DefaultCIMDReferencedURLMaxSize}
+	retryClient := retryablehttp.NewClient()
+	retryClient.HTTPClient = &limitedHTTPClient
+	retryClient.Logger = nil
+	return NewDefaultJWKSFetcherStrategy(JWKSFetcherWithHTTPClient(retryClient))
+}
+
+type cimdResponseSizeLimitTransport struct {
+	base    http.RoundTripper
+	maxSize int64
+}
+
+func (t cimdResponseSizeLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, t.maxSize+1))
+	closeErr := response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if int64(len(body)) > t.maxSize {
+		return nil, errors.New("CIMD referenced response exceeds maximum size")
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return response, nil
+}
+
+// FetchCIMDReferencedURL dereferences a URL taken from the client's metadata document through the
+// SSRF-guarded transport, after re-validating it against the special-use ranges.
+func (c *CIMDClient) FetchCIMDReferencedURL(ctx context.Context, rawURL string) (*http.Response, error) {
+	c.mu.Lock()
+	httpClient, validateURL := c.httpClient, c.validateURL
+	c.mu.Unlock()
+
+	if httpClient == nil || validateURL == nil {
+		return nil, errors.New("CIMD client has no guarded HTTP client")
+	}
+	if err := validateURL(ctx, rawURL); err != nil {
+		return nil, fmt.Errorf("URL referenced by the client metadata document is not safe to fetch: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return httpClient.Do(req)
 }

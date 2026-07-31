@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -44,7 +46,13 @@ func (f *Fosite) resolveClient(ctx context.Context, clientID string) (Client, er
 	return next(ctx, clientID)
 }
 
-// CIMDCachedClient contains a materialized metadata client and its HTTP freshness lifetime.
+// CIMDCachePolicy contains the response cache semantics needed by the resolver.
+type CIMDCachePolicy struct {
+	TTL   time.Duration
+	Store bool
+}
+
+// CIMDCachedClient contains a materialized metadata client and its HTTP cache policy.
 type CIMDCachedClient struct {
 	Client    Client
 	ExpiresAt time.Time
@@ -56,10 +64,12 @@ type CIMDClientCache interface {
 	StoreCIMDClient(context.Context, Client, *ClientMetadataDocument, time.Time) (Client, error)
 }
 
-// CIMDClientCacheEvictor removes an existing cached metadata client when a response forbids storage.
+// CIMDClientCacheEvictor removes a cached metadata client when a response forbids storage.
 type CIMDClientCacheEvictor interface {
 	EvictCIMDClient(context.Context, string) error
 }
+
+var errCIMDNoStoreUnsupported = errors.New("client metadata document uses Cache-Control: no-store, but this authorization server requires metadata caching")
 
 // CIMDClientMaterializer projects a validated metadata document into a provider client.
 type CIMDClientMaterializer interface {
@@ -104,13 +114,37 @@ func (p CIMDClientPolicyFuncs) ValidateCIMDClient(ctx context.Context, document 
 
 // CIMDResolver resolves unregistered Client Identifier URLs while preserving pre-registered-client precedence.
 type CIMDResolver struct {
-	Fetcher      CIMDFetcher
-	Cache        CIMDClientCache
-	Materializer CIMDClientMaterializer
-	Policy       CIMDClientPolicy
-	Now          func() time.Time
+	Fetcher                  CIMDFetcher
+	Cache                    CIMDClientCache
+	Materializer             CIMDClientMaterializer
+	Policy                   CIMDClientPolicy
+	Now                      func() time.Time
+	MaxConcurrentDiscoveries int
 
-	group singleflight.Group
+	group    singleflight.Group
+	initOnce sync.Once
+	slots    chan struct{}
+
+	jwksOnce    sync.Once
+	jwksFetcher JWKSFetcherStrategy
+}
+
+// acquire blocks until a discovery slot is free, or the context is done.
+func (r *CIMDResolver) acquire(ctx context.Context) (release func(), err error) {
+	r.initOnce.Do(func() {
+		if r.MaxConcurrentDiscoveries > 0 {
+			r.slots = make(chan struct{}, r.MaxConcurrentDiscoveries)
+		}
+	})
+	if r.slots == nil {
+		return func() {}, nil
+	}
+	select {
+	case r.slots <- struct{}{}:
+		return func() { <-r.slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 var _ ClientResolver = (*CIMDResolver)(nil)
@@ -119,6 +153,14 @@ var _ ClientResolver = (*CIMDResolver)(nil)
 func (r *CIMDResolver) ResolveClient(ctx context.Context, clientID string, next ClientLookupFunc) (Client, error) {
 	if next == nil {
 		return nil, errors.New("registered client resolver is required")
+	}
+
+	client, err := next(ctx, clientID)
+	if err == nil {
+		return client, nil
+	}
+	if !errors.Is(err, ErrNotFound) || !LooksLikeCIMDURL(clientID) {
+		return nil, err
 	}
 
 	cached, found, err := r.load(ctx, clientID)
@@ -132,16 +174,10 @@ func (r *CIMDResolver) ResolveClient(ctx context.Context, clientID string, next 
 		if r.now().Before(cached.ExpiresAt) {
 			return r.configureClient(cached.Client)
 		}
-		return r.discover(ctx, clientID, next, true)
+		client, err := r.discover(ctx, clientID, next, true)
+		return client, err
 	}
 
-	client, err := next(ctx, clientID)
-	if err == nil {
-		return client, nil
-	}
-	if !errors.Is(err, ErrNotFound) || !LooksLikeCIMDURL(clientID) {
-		return nil, err
-	}
 	return r.discover(ctx, clientID, next, false)
 }
 
@@ -204,7 +240,12 @@ func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string)
 		return nil, err
 	}
 
-	document, ttl, err := r.Fetcher.Fetch(ctx, clientID)
+	release, err := r.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	document, cachePolicy, err := r.Fetcher.Fetch(ctx, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch client metadata: %w", err)
 	}
@@ -218,22 +259,34 @@ func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string)
 	if err != nil {
 		return nil, fmt.Errorf("materialize client metadata: %w", err)
 	}
+	if client == nil {
+		return nil, errors.New("materialized CIMD client is nil")
+	}
+	if client.GetID() != clientID {
+		return nil, fmt.Errorf("materialized CIMD client ID %q does not match requested client_id %q", client.GetID(), clientID)
+	}
 	client, err = r.configureClient(client)
 	if err != nil {
 		return nil, err
 	}
-	if r.Cache == nil {
-		return client, nil
-	}
-	if ttl <= 0 {
-		if evictor, ok := r.Cache.(CIMDClientCacheEvictor); ok {
-			if err := evictor.EvictCIMDClient(ctx, clientID); err != nil {
-				return nil, fmt.Errorf("evict client metadata: %w", err)
-			}
+	if !cachePolicy.Store {
+		if r.Cache == nil {
+			return client, nil
+		}
+		evictor, ok := r.Cache.(CIMDClientCacheEvictor)
+		if !ok {
+			return nil, errCIMDNoStoreUnsupported
+		}
+		if err := evictor.EvictCIMDClient(ctx, clientID); err != nil {
+			return nil, fmt.Errorf("evict client metadata: %w", err)
 		}
 		return client, nil
 	}
-	stored, err := r.Cache.StoreCIMDClient(ctx, client, document, r.now().Add(ttl))
+	if r.Cache == nil {
+		return client, nil
+	}
+
+	stored, err := r.Cache.StoreCIMDClient(ctx, client, document, r.now().Add(cachePolicy.TTL))
 	if err != nil {
 		return nil, fmt.Errorf("store client metadata: %w", err)
 	}
@@ -274,16 +327,38 @@ func (r *CIMDResolver) allow(ctx context.Context, clientID string) error {
 	return nil
 }
 
+// configureClient applies any provider-specific configuration to a materialized metadata client.
 func (r *CIMDResolver) configureClient(client Client) (Client, error) {
-	metadataClient, ok := client.(*CIMDClient)
+	if metadataClient, ok := client.(*CIMDClient); ok {
+		provider, _ := r.Fetcher.(CIMDSecureHTTPClientProvider)
+		if err := metadataClient.configureSecureHTTPClient(provider, r.sharedCIMDJWKSFetcher); err != nil {
+			return nil, fmt.Errorf("configure CIMD client: %w", err)
+		}
+		return metadataClient, nil
+	}
+
+	oidcClient, ok := client.(OpenIDConnectClient)
 	if !ok {
 		return client, nil
 	}
-	provider, _ := r.Fetcher.(CIMDSecureHTTPClientProvider)
-	if err := metadataClient.configureSecureHTTPClient(provider); err != nil {
-		return nil, fmt.Errorf("configure CIMD client: %w", err)
+	if len(oidcClient.GetRequestURIs()) > 0 {
+		if _, ok := client.(CIMDSecureFetcher); !ok {
+			return nil, errors.New("materialized CIMD client with request_uris must implement CIMDSecureFetcher")
+		}
 	}
-	return metadataClient, nil
+	if oidcClient.GetJSONWebKeysURI() != "" {
+		if _, ok := client.(CIMDJWKSResolver); !ok {
+			return nil, errors.New("materialized CIMD client with jwks_uri must implement CIMDJWKSResolver")
+		}
+	}
+	return client, nil
+}
+
+func (r *CIMDResolver) sharedCIMDJWKSFetcher(httpClient *http.Client) JWKSFetcherStrategy {
+	r.jwksOnce.Do(func() {
+		r.jwksFetcher = newCIMDJWKSFetcherStrategy(httpClient)
+	})
+	return r.jwksFetcher
 }
 
 func (r *CIMDResolver) now() time.Time {

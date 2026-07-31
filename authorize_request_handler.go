@@ -84,8 +84,18 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 			return errorsx.WithStack(ErrInvalidRequestURI.WithHintf("Request URI '%s' is not whitelisted by the OAuth 2.0 Client.", location))
 		}
 
-		hc := f.Config.GetHTTPClient(ctx)
-		response, err := hc.Get(location)
+		// A request_uri taken from a Client ID Metadata Document is attacker-authored, so it must be
+		// dereferenced through the SSRF-guarded CIMD transport rather than the authorization
+		// server's general HTTP client (section 8.6 covers "any URLs contained within a Client ID
+		// Metadata Document").
+		var response *http.Response
+		var err error
+		secure, isCIMDClient := oidcClient.(CIMDSecureFetcher)
+		if isCIMDClient {
+			response, err = secure.FetchCIMDReferencedURL(ctx, location)
+		} else {
+			response, err = f.Config.GetHTTPClient(ctx).Get(location)
+		}
 		if err != nil {
 			return errorsx.WithStack(ErrInvalidRequestURI.WithHintf("Unable to fetch OpenID Connect request parameters from 'request_uri' because: %s.", err.Error()).WithWrap(err).WithDebug(err.Error()))
 		}
@@ -95,9 +105,16 @@ func (f *Fosite) authorizeRequestParametersFromOpenIDConnectRequest(ctx context.
 			return errorsx.WithStack(ErrInvalidRequestURI.WithHintf("Unable to fetch OpenID Connect request parameters from 'request_uri' because status code '%d' was expected, but got '%d'.", http.StatusOK, response.StatusCode))
 		}
 
-		body, err := io.ReadAll(response.Body)
+		bodyReader := io.Reader(response.Body)
+		if isCIMDClient {
+			bodyReader = io.LimitReader(response.Body, DefaultCIMDReferencedURLMaxSize+1)
+		}
+		body, err := io.ReadAll(bodyReader)
 		if err != nil {
 			return errorsx.WithStack(ErrInvalidRequestURI.WithHintf("Unable to fetch OpenID Connect request parameters from 'request_uri' because body parsing failed with: %s.", err).WithWrap(err).WithDebug(err.Error()))
+		}
+		if isCIMDClient && len(body) > DefaultCIMDReferencedURLMaxSize {
+			return errorsx.WithStack(ErrInvalidRequestURI.WithHint("Unable to fetch OpenID Connect request parameters from 'request_uri' because the response exceeds the maximum size."))
 		}
 
 		assertion = string(body)
@@ -466,7 +483,11 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 
 	client, err := f.resolveClient(ctx, request.GetRequestForm().Get("client_id"))
 	if err != nil {
-		return request, errorsx.WithStack(ErrInvalidClient.WithHint("The requested OAuth 2.0 Client does not exist.").WithWrap(err).WithDebug(err.Error()))
+		hint := "The requested OAuth 2.0 Client does not exist."
+		if errors.Is(err, errCIMDNoStoreUnsupported) {
+			hint = "The client metadata document uses Cache-Control: no-store, but this authorization server requires metadata caching. Allow the document to be cached and try again."
+		}
+		return request, errorsx.WithStack(ErrInvalidClient.WithHint(hint).WithWrap(err).WithDebug(err.Error()))
 	}
 	request.Client = client
 

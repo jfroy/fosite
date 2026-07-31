@@ -4,6 +4,8 @@
 package fosite
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -35,9 +37,13 @@ func cimdMockResponse(status int, body string) *http.Response {
 	}
 }
 
+func cimdMockTransport(rt http.RoundTripper) CIMDFetcherOption {
+	return WithCIMDTransport(rt)
+}
+
 func newTestFetcher(responses map[string]*http.Response) *DefaultCIMDFetcher {
 	return NewDefaultCIMDFetcher(
-		WithCIMDTransport(&cimdMockRoundTripper{responses: responses}),
+		cimdMockTransport(&cimdMockRoundTripper{responses: responses}),
 	)
 }
 
@@ -49,15 +55,21 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 		resp := cimdMockResponse(http.StatusOK, body)
 		resp.Header.Set("Cache-Control", "max-age=600")
 		f := newTestFetcher(map[string]*http.Response{id: resp})
-		doc, ttl, err := f.Fetch(t.Context(), id)
+		doc, cachePolicy, err := f.Fetch(t.Context(), id)
 		require.NoError(t, err)
 		assert.Equal(t, id, doc.ClientID)
 		assert.Equal(t, "App", doc.ClientName)
-		assert.Equal(t, 10*time.Minute, ttl)
+		assert.Equal(t, CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}, cachePolicy)
 	})
 
 	t.Run("non-200 is an error", func(t *testing.T) {
 		f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(http.StatusNotFound, "nope")})
+		_, _, err := f.Fetch(t.Context(), id)
+		require.Error(t, err)
+	})
+
+	t.Run("service unavailable is an error", func(t *testing.T) {
+		f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(http.StatusServiceUnavailable, "nope")})
 		_, _, err := f.Fetch(t.Context(), id)
 		require.Error(t, err)
 	})
@@ -112,17 +124,37 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 	})
 }
 
-func TestDefaultCIMDFetcher_ParseCacheTTL(t *testing.T) {
+func TestDefaultCIMDFetcher_ParseCachePolicy(t *testing.T) {
 	f := NewDefaultCIMDFetcher()
-	assert.Equal(t, DefaultCIMDCacheTTL, f.parseCacheTTL(""))
-	assert.Equal(t, time.Duration(0), f.parseCacheTTL("no-store"))
-	assert.Equal(t, time.Duration(0), f.parseCacheTTL("max-age=600, no-cache"))
-	assert.Equal(t, time.Duration(0), f.parseCacheTTL("max-age=0"))
-	assert.Equal(t, 10*time.Minute, f.parseCacheTTL("max-age=600"))
-	assert.Equal(t, 10*time.Minute, f.parseCacheTTL(`MAX-AGE="600"`))
-	assert.Equal(t, DefaultCIMDMinCacheTTL, f.parseCacheTTL("max-age=1"))
-	assert.Equal(t, DefaultCIMDMaxCacheTTL, f.parseCacheTTL("max-age=999999"))
-	assert.Equal(t, 10*time.Minute, f.parseCacheTTL("public, max-age=600"))
+	now := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		header   http.Header
+		expected CIMDCachePolicy
+	}{
+		{name: "default", header: http.Header{}, expected: CIMDCachePolicy{TTL: DefaultCIMDCacheTTL, Store: true}},
+		{name: "no store", header: http.Header{"Cache-Control": {"no-store"}}, expected: CIMDCachePolicy{}},
+		{name: "no cache", header: http.Header{"Cache-Control": {"max-age=600, no-cache"}}, expected: CIMDCachePolicy{Store: true}},
+		{name: "must revalidate", header: http.Header{"Cache-Control": {"max-age=600, must-revalidate"}}, expected: CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}},
+		{name: "proxy revalidate", header: http.Header{"Cache-Control": {"max-age=600, proxy-revalidate"}}, expected: CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}},
+		{name: "zero max age", header: http.Header{"Cache-Control": {"max-age=0"}}, expected: CIMDCachePolicy{Store: true}},
+		{name: "max age", header: http.Header{"Cache-Control": {"max-age=600"}}, expected: CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}},
+		{name: "quoted max age", header: http.Header{"Cache-Control": {`MAX-AGE="600"`}}, expected: CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}},
+		{name: "short max age is not extended", header: http.Header{"Cache-Control": {"max-age=1"}}, expected: CIMDCachePolicy{TTL: time.Second, Store: true}},
+		{name: "bounded max age", header: http.Header{"Cache-Control": {"max-age=999999"}}, expected: CIMDCachePolicy{TTL: DefaultCIMDMaxCacheTTL, Store: true}},
+		{name: "overflowing max age is bounded", header: http.Header{"Cache-Control": {"max-age=9223372036854775807"}}, expected: CIMDCachePolicy{TTL: DefaultCIMDMaxCacheTTL, Store: true}},
+		{name: "age reduces freshness", header: http.Header{"Cache-Control": {"max-age=600"}, "Age": {"120"}}, expected: CIMDCachePolicy{TTL: 8 * time.Minute, Store: true}},
+		{name: "overflowing age expires entry", header: http.Header{"Cache-Control": {"max-age=600"}, "Age": {"9223372036854775807"}}, expected: CIMDCachePolicy{Store: true}},
+		{name: "s maxage wins", header: http.Header{"Cache-Control": {"max-age=600, s-maxage=120"}}, expected: CIMDCachePolicy{TTL: 2 * time.Minute, Store: true}},
+		{name: "expires", header: http.Header{"Date": {now.Format(http.TimeFormat)}, "Expires": {now.Add(15 * time.Minute).Format(http.TimeFormat)}}, expected: CIMDCachePolicy{TTL: 15 * time.Minute, Store: true}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, f.parseCachePolicy(tc.header, now))
+		})
+	}
 }
 
 func TestDefaultCIMDFetcher_IsPrivateIP(t *testing.T) {
@@ -159,12 +191,39 @@ func TestDefaultCIMDFetcher_IsPrivateIP(t *testing.T) {
 
 func TestDefaultCIMDFetcher_AllowPrivateIPs(t *testing.T) {
 	const id = "https://127.0.0.1/oauth/client"
-	body := `{"client_id":"https://127.0.0.1/oauth/client","token_endpoint_auth_method":"none"}`
+	body := `{"client_id":"https://127.0.0.1/oauth/client","token_endpoint_auth_method":"none","redirect_uris":["https://127.0.0.1/cb"]}`
 	f := NewDefaultCIMDFetcher(
-		WithCIMDTransport(&cimdMockRoundTripper{responses: map[string]*http.Response{id: cimdMockResponse(http.StatusOK, body)}}),
+		cimdMockTransport(&cimdMockRoundTripper{responses: map[string]*http.Response{id: cimdMockResponse(http.StatusOK, body)}}),
 		WithCIMDAllowPrivateIPs(true),
 	)
 	doc, _, err := f.Fetch(t.Context(), id)
 	require.NoError(t, err)
 	assert.Equal(t, id, doc.ClientID)
+}
+
+func TestDefaultCIMDFetcher_BoundsResponseHeaders(t *testing.T) {
+	f := NewDefaultCIMDFetcher(WithCIMDMaxSize(1234))
+	tr, ok := f.client.Transport.(*http.Transport)
+	require.True(t, ok)
+	// The size and timeout limits cover headers too, where net/http would otherwise allow 10 MiB
+	assert.Equal(t, int64(1234*8), tr.MaxResponseHeaderBytes)
+	assert.Equal(t, DefaultCIMDFetchTimeout, tr.ResponseHeaderTimeout)
+	assert.Nil(t, tr.Proxy)
+}
+
+func TestDefaultCIMDFetcher_CustomTransportCannotBypassGuardedDialer(t *testing.T) {
+	custom := &http.Transport{
+		DialTLS: func(_, _ string) (net.Conn, error) {
+			return nil, errors.New("must not be called")
+		},
+		DialTLSContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return nil, errors.New("must not be called")
+		},
+	}
+	f := NewDefaultCIMDFetcher(WithCIMDTransport(custom))
+	guarded, ok := f.client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Nil(t, guarded.DialTLS)
+	assert.Nil(t, guarded.DialTLSContext)
+	assert.NotNil(t, guarded.DialContext)
 }
