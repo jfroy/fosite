@@ -9,9 +9,11 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +48,19 @@ func mustGenerateNoneAssertion(t *testing.T, claims jwt.MapClaims) string {
 	tokenString, err := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
 	require.NoError(t, err)
 	return tokenString
+}
+
+type stubCIMDSecureRequestURIClient struct {
+	*DefaultOpenIDConnectClient
+	body string
+}
+
+func (c *stubCIMDSecureRequestURIClient) FetchCIMDReferencedURL(context.Context, string) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(c.body)),
+		Header:     make(http.Header),
+	}, nil
 }
 
 func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
@@ -83,6 +98,10 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 	}
 	reqTS := httptest.NewServer(reqH)
 	defer reqTS.Close()
+	hugeReqTS := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		_, _ = rw.Write([]byte(strings.Repeat("a", DefaultCIMDReferencedURLMaxSize+1)))
+	}))
+	defer hugeReqTS.Close()
 
 	var hJWK http.HandlerFunc = func(rw http.ResponseWriter, r *http.Request) {
 		require.NoError(t, json.NewEncoder(rw).Encode(jwks))
@@ -202,6 +221,23 @@ func TestAuthorizeRequestParametersFromOpenIDConnectRequest(t *testing.T) {
 			form:       url.Values{"scope": {"openid"}, "request_uri": {reqTS.URL}},
 			client:     &DefaultOpenIDConnectClient{JSONWebKeysURI: reqJWK.URL, RequestObjectSigningAlgorithm: "RS256", RequestURIs: []string{reqTS.URL}},
 			expectForm: url.Values{"response_type": {"token"}, "response_mode": {"post_form"}, "scope": {"foo"}, "request_uri": {reqTS.URL}, "foo": {"bar"}, "baz": {"baz"}},
+		},
+		{
+			d:    "should reject an oversized CIMD request_uri response",
+			form: url.Values{"scope": {"openid"}, "request_uri": {hugeReqTS.URL}},
+			client: &stubCIMDSecureRequestURIClient{
+				DefaultOpenIDConnectClient: &DefaultOpenIDConnectClient{RequestURIs: []string{hugeReqTS.URL}},
+				body:                       strings.Repeat("a", DefaultCIMDReferencedURLMaxSize+1),
+			},
+			expectErr:  ErrInvalidRequestURI,
+			expectForm: url.Values{"scope": {"openid"}},
+		},
+		{
+			d:          "should not apply the CIMD size limit to another request_uri client",
+			form:       url.Values{"scope": {"openid"}, "request_uri": {hugeReqTS.URL}},
+			client:     &DefaultOpenIDConnectClient{RequestURIs: []string{hugeReqTS.URL}},
+			expectErr:  ErrInvalidRequestObject,
+			expectForm: url.Values{"scope": {"openid"}},
 		},
 		{
 			d:          "should pass when request object uses algorithm none",
