@@ -109,12 +109,21 @@ func toRFCErr(v *jwt.ValidationError) *fosite.RFC6749Error {
 }
 
 func (h *DefaultJWTStrategy) generate(ctx context.Context, tokenType fosite.TokenType, requester fosite.Requester) (string, string, error) {
+	claims, header, err := h.prepareJWT(ctx, tokenType, requester)
+	if err != nil {
+		return "", "", err
+	}
+
+	return h.Signer.Generate(ctx, claims, header)
+}
+
+func (h *DefaultJWTStrategy) prepareJWT(ctx context.Context, tokenType fosite.TokenType, requester fosite.Requester) (jwt.MapClaims, *jwt.Headers, error) {
 	if jwtSession, ok := requester.GetSession().(JWTSessionContainer); !ok {
-		return "", "", errors.Errorf("Session must be of type JWTSessionContainer but got type: %T", requester.GetSession())
+		return nil, nil, errors.Errorf("Session must be of type JWTSessionContainer but got type: %T", requester.GetSession())
 	} else if claims := jwtSession.GetJWTClaims(); claims == nil {
-		return "", "", errors.New("GetTokenClaims() must not be nil")
+		return nil, nil, errors.New("GetTokenClaims() must not be nil")
 	} else {
-		claims.
+		mapClaims := claims.
 			With(
 				jwtSession.GetExpiresAt(tokenType),
 				requester.GetGrantedScopes(),
@@ -126,8 +135,9 @@ func (h *DefaultJWTStrategy) generate(ctx context.Context, tokenType fosite.Toke
 			).
 			WithScopeField(
 				h.Config.GetJWTScopeField(ctx),
-			)
+			).
+			ToMapClaims()
 
-		return h.Signer.Generate(ctx, claims.ToMapClaims(), jwtSession.GetJWTHeader())
+		return mapClaims, jwtSession.GetJWTHeader(), nil
 	}
 }
