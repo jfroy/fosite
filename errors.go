@@ -84,6 +84,14 @@ var (
 		HintField:        "Make sure that the requested resource is correct and available to this client.",
 		CodeField:        http.StatusBadRequest,
 	}
+	// ErrInvalidRedirectURI is returned when a dynamic client registration request
+	// carries a redirect_uri the authorization server will not accept.
+	// See https://datatracker.ietf.org/doc/html/rfc7591#section-3.2.2
+	ErrInvalidRedirectURI = &RFC6749Error{
+		ErrorField:       errInvalidRedirectURIName,
+		DescriptionField: "The value of one or more redirection URIs is invalid.",
+		CodeField:        http.StatusBadRequest,
+	}
 	ErrServerError = &RFC6749Error{
 		ErrorField:       errServerErrorName,
 		DescriptionField: "The authorization server encountered an unexpected condition that prevented it from fulfilling the request.",
@@ -250,6 +258,7 @@ const (
 	errInvalidScopeName            = "invalid_scope"
 	errServerErrorName             = "server_error"
 	errInvalidTargetName           = "invalid_target"
+	errInvalidRedirectURIName      = "invalid_redirect_uri"
 	errTemporarilyUnavailableName  = "temporarily_unavailable"
 	errUnsupportedGrantTypeName    = "unsupported_grant_type"
 	errInvalidGrantName            = "invalid_grant"

@@ -168,6 +168,40 @@ func IsValidRedirectURI(redirectURI *url.URL) bool {
 	return true
 }
 
+// activeContentSchemes are URI schemes that must never be used as a redirect
+// target. They either execute script in the browsing context performing the
+// redirect (javascript, vbscript) or carry attacker-controlled inline or local
+// content (data, blob, file, about, filesystem).
+//
+// Redirecting to one of these is an XSS or local-file-disclosure primitive
+// rather than a real callback. This matters most for dynamically registered
+// clients (RFC 7591), where the redirect URI comes from an untrusted caller and
+// an authorization server's allowlist may legitimately contain a scheme
+// wildcard.
+var activeContentSchemes = map[string]struct{}{
+	"javascript": {},
+	"vbscript":   {},
+	"data":       {},
+	"blob":       {},
+	"file":       {},
+	"about":      {},
+	"filesystem": {},
+}
+
+// IsActiveContentRedirectURI reports whether the redirect URI uses a scheme that
+// executes or embeds active content. Such URIs must be rejected regardless of
+// any client- or server-configured allowlist.
+//
+// Private-use (custom) schemes remain acceptable so native apps following
+// RFC 8252 continue to work; only the known-dangerous schemes are rejected.
+func IsActiveContentRedirectURI(redirectURI *url.URL) bool {
+	if redirectURI == nil {
+		return false
+	}
+	_, bad := activeContentSchemes[strings.ToLower(redirectURI.Scheme)]
+	return bad
+}
+
 func IsRedirectURISecure(ctx context.Context, redirectURI *url.URL) bool {
 	return !(redirectURI.Scheme == "http" && !IsLocalhost(redirectURI))
 }
