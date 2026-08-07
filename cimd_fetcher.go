@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -189,8 +188,9 @@ func (f *DefaultCIMDFetcher) buildHTTPClient() *http.Client {
 	return c
 }
 
-// guardTransport clones tr and, unless private IPs are allowed, installs a
-// connect-time SSRF check via the dialer's Control hook.
+// guardTransport clones tr and, unless private IPs are allowed, hardens it with
+// the shared SSRF guard so a client-supplied metadata document URL cannot reach
+// an internal address.
 func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTripper {
 	if tr == nil {
 		tr = &http.Transport{}
@@ -206,32 +206,7 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 		return tr
 	}
 
-	// A proxy would hide the final destination from the guarded dialer and bypass its IP checks.
-	tr.Proxy = nil
-	// Custom TLS dialers bypass DialContext, so the guarded transport must perform the TLS handshake itself.
-	tr.DialTLS = nil
-	tr.DialTLSContext = nil
-
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control: func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				return fmt.Errorf("could not parse dialed address %q", address)
-			}
-			if f.isSpecialUseIP(ip) {
-				return errors.New("special-use IP addresses are not allowed")
-			}
-			return nil
-		},
-	}
-	tr.DialContext = dialer.DialContext
-	return tr
+	return SSRFGuardedTransport(tr, f.isSpecialUseIP)
 }
 
 func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadataDocument, CIMDCachePolicy, error) {
